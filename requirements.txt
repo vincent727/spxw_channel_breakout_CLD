@@ -1,0 +1,41 @@
+# SPXW 0DTE 期权自动交易系统 V4 - 依赖
+
+# 核心库
+ib_insync>=0.9.86
+pandas>=2.0.0
+numpy>=1.24.0
+
+# 配置和验证
+pydantic>=2.0.0
+pyyaml>=6.0
+
+# 异步数据库
+aiosqlite>=0.19.0
+
+# 交易日历
+pandas_market_calendars>=4.3.0
+
+# 异步HTTP
+aiohttp>=3.8.0
+
+# 异步邮件
+aiosmtplib>=2.0.0
+
+# Web UI
+nicegui>=1.4.0
+
+# 数据存储
+pyarrow>=14.0.0  # Parquet 支持
+fastparquet>=2023.10.0
+
+# 测试
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# 开发工具
+black>=23.0.0
+isort>=5.12.0
+mypy>=1.5.0
+
+# 日志
+colorlog>=6.7.0

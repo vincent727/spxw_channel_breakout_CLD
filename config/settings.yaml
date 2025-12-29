@@ -1,0 +1,229 @@
+# ===== SPXW 0DTE 期权自动交易系统配置 V4 =====
+
+# ===== 系统配置 =====
+system:
+  mode: "paper"  # paper | live | backtest
+  log_level: "INFO"
+  timezone: "America/New_York"
+
+# ===== 存储配置 =====
+storage:
+  # 交易数据库
+  db_path: "data/trading_state.db"
+  
+  # Tick 快照
+  tick_snapshot_path: "data/tick_snapshots/"
+  
+  # 历史数据
+  historical_data_path: "data/historical/"
+  historical_format: "parquet"  # parquet | csv
+  
+  # 内存 Tick 缓冲
+  tick_buffer_size: 1000
+
+# ===== IBKR 连接配置 =====
+ibkr:
+  host: "127.0.0.1"
+  port: 7497  # TWS Paper: 7497, TWS Live: 7496, Gateway Paper: 4002, Gateway Live: 4001
+  client_id: 1
+  timeout: 30
+  
+  # 重连配置
+  reconnect_attempts: 5
+  reconnect_delays: [1, 2, 4, 8, 16]
+  
+  # 限流保护
+  rate_limit:
+    max_requests_per_second: 45
+    max_subscriptions: 100
+    historical_requests_per_10min: 55
+  
+  # Tick 数据配置
+  tick:
+    use_tick_by_tick: true
+    tick_type: "Last"
+    stale_threshold_seconds: 5
+    stale_action: "alert"  # alert | close_position
+
+# ===== 交易标的配置 =====
+instrument:
+  underlying: "SPX"
+  option_type: "SPXW"
+  exchange: "SMART"
+  currency: "USD"
+
+# ===== 期权池配置 =====
+option_pool:
+  enabled: true
+  strikes_around_atm: 2        # ATM ± 2 档
+  refresh_price_threshold: 5   # SPX 变动超过 5 点刷新
+  refresh_interval_seconds: 60 # 最长刷新间隔
+
+# ===== 策略参数 =====
+strategy:
+  # K线周期
+  bar_size: "5 mins"
+  trend_bar_size: "1 hour"
+  
+  # 历史数据预热
+  warmup_bars: 120              # 预热需要的历史 K 线数量
+  warmup_trend_bars: 48         # 趋势周期预热数量
+  
+  # 通道参数
+  channel_lookback: 20
+  channel_type: "body"  # body | wick
+  
+  # 趋势参数
+  ema_period: 20
+  slope_bull_threshold: 0.0005
+  slope_bear_threshold: -0.0005
+  
+  # 信号过滤
+  cooldown_bars: 3
+  signal_lock_seconds: 60
+  max_concurrent_positions: 3   # 最大并发持仓数
+
+# ===== 期权选择参数 =====
+option_selection:
+  strike_offset: 0
+  strike_interval: 5
+  prefer_otm: true
+  min_delta: 0.30
+  max_delta: 0.50
+  min_open_interest: 100
+  min_bid: 0.50
+  
+  # 流动性检查
+  liquidity:
+    max_bid_ask_spread: 0.20
+    max_spread_pct: 0.05
+    min_bid_size: 10
+    min_ask_size: 10
+    reject_wide_spread: true
+
+# ===== 订单执行参数 =====
+execution:
+  order_type: "LMT"
+  limit_price_buffer: 0.05
+  order_timeout: 30
+  max_slippage: 0.10
+  position_size: 1
+  max_position: 5
+  max_premium_per_trade: 500
+  
+  # 买方保护 - CRITICAL
+  enforce_long_only: true
+
+# ===== 风险管理参数 =====
+risk:
+  # 止损触发阈值
+  hard_stop_pct: 0.20
+  breakeven_trigger_pct: 0.15
+  trailing_activation_pct: 0.30
+  trailing_stop_pct: 0.10
+  
+  # Tick 过滤 (防止 Bad Tick)
+  tick_filter:
+    enabled: true
+    mid_deviation_threshold: 0.10    # Last 偏离 Mid 超过 10% 视为无效
+    jump_threshold: 0.20             # 单 Tick 跳变超过 20% 视为可疑
+    confirm_ticks: 2                 # 需要连续 2 个 Tick 确认
+    confirm_duration_ms: 50          # 或持续 50ms
+  
+  # 动态追单止损配置 ⭐ CRITICAL
+  chase_stop:
+    # Phase 1: 激进限价
+    initial_buffer: 0.10
+    
+    # Phase 2: 动态追单
+    chase_interval_ms: 500
+    chase_buffer: 0.10
+    max_chase_count: 3
+    max_chase_duration_ms: 2000
+    
+    # Phase 3: 紧急抛售
+    panic_loss_threshold: 0.40
+    panic_price_factor: 0.80
+    abandon_price_threshold: 0.20
+    
+    # 最后手段
+    enable_market_fallback: true
+    market_fallback_delay_ms: 1000
+  
+  # 熔断器
+  daily_loss_limit: 1000
+  max_daily_trades: 20
+  circuit_breaker_cooldown: 3600
+  
+  # 时间控制
+  market_close_buffer_minutes: 10
+  trading_start_buffer_minutes: 5
+
+# ===== 绩效追踪参数 =====
+performance:
+  snapshot_interval: 60
+  daily_summary_time: "16:30"
+  rolling_window_days: 30
+  benchmark: "SPY"
+  auto_export_daily: true
+  export_format: "csv"
+  export_path: "reports/"
+
+# ===== 通知配置 =====
+notification:
+  enabled: true
+  
+  triggers:
+    on_trade_open: true
+    on_trade_close: true
+    on_stop_loss: true
+    on_stop_abandoned: true
+    on_circuit_breaker: true
+    on_error: true
+    on_pacing_violation: true
+    on_daily_summary: true
+    pnl_threshold: 500
+  
+  telegram:
+    enabled: true
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_id: "${TELEGRAM_CHAT_ID}"
+    parse_mode: "HTML"
+    rate_limit: 30
+  
+  email:
+    enabled: false
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    use_tls: true
+    username: "${EMAIL_USERNAME}"
+    password: "${EMAIL_PASSWORD}"
+    from_addr: "trading-bot@example.com"
+    to_addrs: ["your-email@example.com"]
+
+# ===== 回测配置 =====
+backtest:
+  data_source: "parquet"
+  data_path: "data/historical/"
+  start_date: "2024-01-01"
+  end_date: "2024-12-31"
+  initial_capital: 100000
+  commission_per_contract: 0.65
+  slippage_model: "fixed"
+  slippage_value: 0.05
+  
+  # Tick 模拟
+  simulate_ticks_from_bars: true
+  tick_simulation_points: 4  # OHLC
+  
+  save_trades: true
+  save_equity_curve: true
+  generate_report: true
+
+# ===== UI 配置 =====
+ui:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8080
+  refresh_rate: 1000
+  theme: "dark"
