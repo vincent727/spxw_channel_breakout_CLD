@@ -163,6 +163,7 @@ class DailyStats:
     avg_win: float = 0.0
     avg_loss: float = 0.0
     profit_factor: float = 0.0
+    created_at: Optional[str] = None  # 数据库自动生成
 
 
 # ============================================================================

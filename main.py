@@ -377,12 +377,12 @@ class TradingSystem:
                     await self.state.add_trade(trade)
                     
                     # 清除 TradingEngine 的持仓方向状态
+                    # 平仓成功，直接清除方向
                     if self.trading_engine:
-                        # 检查是否还有其他持仓
-                        remaining = self.state.get_all_positions()
-                        if not remaining:
+                        old_direction = self.trading_engine.state.current_position_direction
+                        if old_direction:
                             self.trading_engine.state.current_position_direction = ""
-                            logger.info("Position direction cleared (no remaining positions)")
+                            logger.info(f"Position direction cleared: {old_direction} (exit filled)")
                     
                     # 更新熔断器
                     await self.circuit_breaker.record_trade_result(
@@ -406,7 +406,7 @@ class TradingSystem:
         )
         
         if event.success:
-            # 获取持仓信息
+            # 获取持仓信息（在关闭前获取）
             position = self.state.get_position(event.position_id)
             if position:
                 # 记录交易
@@ -436,11 +436,12 @@ class TradingSystem:
                 )
             
             # 清除 TradingEngine 的持仓方向状态
+            # 止损成功意味着持仓已平，直接清除方向
             if self.trading_engine:
-                remaining = self.state.get_all_positions()
-                if not remaining:
+                old_direction = self.trading_engine.state.current_position_direction
+                if old_direction:
                     self.trading_engine.state.current_position_direction = ""
-                    logger.info("Position direction cleared (stop executed, no remaining positions)")
+                    logger.info(f"Position direction cleared: {old_direction} (stop executed)")
     
     async def start(self) -> None:
         """启动交易系统 - 使用 Warm-up 工作流"""
