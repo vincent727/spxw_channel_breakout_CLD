@@ -277,9 +277,9 @@ class OrderManager:
         self.active_orders[trade.order.orderId] = context
         self.total_orders += 1
         
-        # 注册回调
+        # 注册回调 (注意: filledEvent 只传 trade，fill 从 trade.fills 获取)
         trade.statusEvent += lambda t: self._on_order_status(t, context)
-        trade.filledEvent += lambda t, fill: self._on_fill(t, fill, context)
+        trade.filledEvent += lambda t: self._on_fill(t, context)
         
         # 保存订单记录
         await self.state.add_order(OrderRecord(
@@ -395,9 +395,9 @@ class OrderManager:
         self.active_orders[trade.order.orderId] = context
         self.total_orders += 1
         
-        # 注册回调
+        # 注册回调 (注意: filledEvent 只传 trade，fill 从 trade.fills 获取)
         trade.statusEvent += lambda t: self._on_order_status(t, context)
-        trade.filledEvent += lambda t, fill: self._on_fill(t, fill, context)
+        trade.filledEvent += lambda t: self._on_fill(t, context)
         
         # 保存订单记录
         await self.state.add_order(OrderRecord(
@@ -504,8 +504,20 @@ class OrderManager:
             if status == "Filled":
                 self.filled_orders += 1
     
-    def _on_fill(self, trade: Trade, fill: Any, context: OrderContext) -> None:
-        """成交回调"""
+    def _on_fill(self, trade: Trade, context: OrderContext) -> None:
+        """
+        成交回调
+        
+        注意: ib_insync 的 filledEvent 可能只传 trade，
+        所以我们从 trade.fills 中获取最新的 fill 信息
+        """
+        if not trade.fills:
+            logger.warning(f"Order {context.order_id} filled but no fill info")
+            return
+        
+        # 获取最新的 fill
+        fill = trade.fills[-1]
+        
         logger.info(
             f"Order {context.order_id} filled: "
             f"{context.action} {fill.execution.shares} @ ${fill.execution.price}"

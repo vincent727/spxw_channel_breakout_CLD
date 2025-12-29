@@ -258,6 +258,15 @@ class TradingSystem:
             logger.warning(f"Signal blocked by circuit breaker: {reason}")
             return
         
+        # 检查当前持仓数量
+        positions = self.trading_state.get_all_positions()
+        max_positions = self.config.strategy.max_concurrent_positions
+        if len(positions) >= max_positions:
+            logger.warning(
+                f"Signal blocked: Max positions reached ({len(positions)}/{max_positions})"
+            )
+            return
+        
         logger.info(f"Processing signal: {event.signal_type}")
         
         # 获取 SPX 价格 (优先使用事件中的价格，其次从引擎获取)
