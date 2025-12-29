@@ -93,12 +93,12 @@ option_selection:
   min_open_interest: 100
   min_bid: 0.50
   
-  # 流动性检查
+  # 流动性检查 (0DTE 期权需要更宽松的设置)
   liquidity:
-    max_bid_ask_spread: 0.20
-    max_spread_pct: 0.05
-    min_bid_size: 10
-    min_ask_size: 10
+    max_bid_ask_spread: 0.30     # 最大绝对价差 $0.30
+    max_spread_pct: 0.10         # 最大价差比例 10%
+    min_bid_size: 1              # 最小买盘量 (0DTE 挂单量波动大)
+    min_ask_size: 1              # 最小卖盘量 (0DTE 挂单量波动大)
     reject_wide_spread: true
 
 # ===== 订单执行参数 =====

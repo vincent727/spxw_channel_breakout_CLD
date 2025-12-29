@@ -90,7 +90,8 @@ class OptionSelector:
     async def select_option(
         self,
         signal: SignalEvent,
-        spx_price: float
+        spx_price: float,
+        max_retries: int = 2
     ) -> Optional[OptionCandidate]:
         """
         根据信号选择最佳期权
@@ -98,6 +99,7 @@ class OptionSelector:
         Args:
             signal: 交易信号
             spx_price: 当前 SPX 价格
+            max_retries: 最大重试次数（市场数据可能需要时间刷新）
         
         Returns:
             最佳期权候选或 None
@@ -111,11 +113,20 @@ class OptionSelector:
             logger.error(f"Unknown signal type: {signal.signal_type}")
             return None
         
-        # 获取候选合约
-        candidates = await self._get_candidates(right, spx_price)
+        # 带重试的获取候选合约
+        candidates = None
+        for attempt in range(max_retries + 1):
+            candidates = await self._get_candidates(right, spx_price)
+            
+            if candidates:
+                break
+            
+            if attempt < max_retries:
+                logger.debug(f"No candidates found, retry {attempt + 1}/{max_retries}...")
+                await self.ib.sleep(0.5)  # 等待市场数据刷新
         
         if not candidates:
-            logger.warning(f"No suitable {right} options found")
+            logger.warning(f"No suitable {right} options found after {max_retries + 1} attempts")
             return None
         
         # 选择最佳
@@ -150,15 +161,28 @@ class OptionSelector:
             if not ticker:
                 continue
             
-            # 检查基本报价
+            # 检查基本报价 (增加 NaN 检查)
+            import math
             bid = ticker.bid
             ask = ticker.ask
             
-            if bid is None or ask is None or bid <= 0:
+            # 跳过无效报价
+            if bid is None or ask is None:
+                logger.debug(f"Skipping {contract.localSymbol}: No bid/ask data")
+                continue
+            if isinstance(bid, float) and math.isnan(bid):
+                logger.debug(f"Skipping {contract.localSymbol}: Bid is NaN")
+                continue
+            if isinstance(ask, float) and math.isnan(ask):
+                logger.debug(f"Skipping {contract.localSymbol}: Ask is NaN")
+                continue
+            if bid <= 0 or ask <= 0:
+                logger.debug(f"Skipping {contract.localSymbol}: Invalid bid=${bid} ask=${ask}")
                 continue
             
             # 检查最低 bid
             if bid < self.config.min_bid:
+                logger.debug(f"Skipping {contract.localSymbol}: Bid ${bid} < min ${self.config.min_bid}")
                 continue
             
             mid = (bid + ask) / 2
@@ -204,15 +228,15 @@ class OptionSelector:
         # 先检查是否已订阅
         ticker = self.ib.get_ticker(contract)
         
-        if ticker:
+        if ticker and ticker.bid and ticker.bid > 0:
             return ticker
         
         # 临时订阅获取报价
         ticker = await self.ib.subscribe_market_data(contract)
         
         if ticker:
-            # 等待报价填充
-            await self.ib.sleep(0.1)
+            # 等待报价填充 (增加等待时间)
+            await self.ib.sleep(0.5)
             return self.ib.get_ticker(contract)
         
         return None

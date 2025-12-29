@@ -102,8 +102,8 @@ class LiquidityConfig(BaseModel):
     """流动性检查配置"""
     max_bid_ask_spread: float = Field(default=0.20, ge=0.05, le=1.0)
     max_spread_pct: float = Field(default=0.05, ge=0.01, le=0.20)
-    min_bid_size: int = Field(default=10, ge=1, le=100)
-    min_ask_size: int = Field(default=10, ge=1, le=100)
+    min_bid_size: int = Field(default=1, ge=1, le=100)  # 放宽：0DTE 期权挂单量波动大
+    min_ask_size: int = Field(default=1, ge=1, le=100)  # 放宽：0DTE 期权挂单量波动大
     reject_wide_spread: bool = True
 
 
