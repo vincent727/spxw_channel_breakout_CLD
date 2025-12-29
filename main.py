@@ -48,7 +48,7 @@ from core import (
     TradingConfig, load_config, set_config,
     EventBus, set_event_bus,
     TradingState, set_state,
-    ConnectionEvent, SystemStatusEvent, SignalEvent, FillEvent
+    ConnectionEvent, SystemStatusEvent, SignalEvent, FillEvent, StopExecutionResultEvent
 )
 from core.calendar import get_trading_calendar, get_0dte_expiry
 from execution import (
@@ -247,6 +247,9 @@ class TradingSystem:
         # 成交 -> 持仓管理
         self.event_bus.subscribe(FillEvent, self._on_fill)
         
+        # 止损执行结果 -> 清理状态
+        self.event_bus.subscribe(StopExecutionResultEvent, self._on_stop_result)
+        
         # 连接状态
         self.event_bus.subscribe(ConnectionEvent, self._on_connection)
     
@@ -393,6 +396,51 @@ class TradingSystem:
             logger.warning("Connection lost!")
         elif event.status == "CONNECTED":
             logger.info("Connection restored")
+    
+    async def _on_stop_result(self, event: StopExecutionResultEvent) -> None:
+        """处理止损执行结果"""
+        pnl_str = f"pnl=${event.pnl:.2f} ({event.pnl_pct:.1%})" if event.pnl else "pnl=N/A"
+        logger.info(
+            f"Stop result: position={event.position_id[:8]}... "
+            f"phase={event.phase} success={event.success} {pnl_str}"
+        )
+        
+        if event.success:
+            # 获取持仓信息
+            position = self.state.get_position(event.position_id)
+            if position:
+                # 记录交易
+                from core.state import Trade
+                
+                trade = Trade(
+                    position_id=event.position_id,
+                    contract_id=position.contract_id,
+                    contract_symbol=position.contract_symbol,
+                    direction=position.direction,
+                    entry_time=position.entry_time,
+                    entry_price=position.entry_price,
+                    exit_time=datetime.now(),
+                    exit_price=event.fill_price or 0,
+                    quantity=position.quantity,
+                    realized_pnl=event.pnl or 0,
+                    status="CLOSED"
+                )
+                trade.realized_pnl_pct = event.pnl_pct or 0
+                
+                await self.state.add_trade(trade)
+                
+                # 更新熔断器
+                await self.circuit_breaker.record_trade_result(
+                    trade.realized_pnl,
+                    trade.realized_pnl > 0
+                )
+            
+            # 清除 TradingEngine 的持仓方向状态
+            if self.trading_engine:
+                remaining = self.state.get_all_positions()
+                if not remaining:
+                    self.trading_engine.state.current_position_direction = ""
+                    logger.info("Position direction cleared (stop executed, no remaining positions)")
     
     async def start(self) -> None:
         """启动交易系统 - 使用 Warm-up 工作流"""

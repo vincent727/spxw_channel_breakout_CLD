@@ -57,7 +57,7 @@ option_pool:
   enabled: true
   strikes_around_atm: 2        # ATM ± 2 档
   refresh_price_threshold: 5   # SPX 变动超过 5 点刷新
-  refresh_interval_seconds: 60 # 最长刷新间隔
+  refresh_interval_seconds: 300 # 最长刷新间隔（5分钟）
 
 # ===== 策略参数 =====
 strategy:
