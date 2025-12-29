@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 # 配置日志（在其他模块导入之前）
 from core.logging_config import setup_logging
-setup_logging(log_dir="logs", log_level=logging.DEBUG)
+setup_logging(log_dir="logs", log_level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 from core import (
@@ -259,7 +259,7 @@ class TradingSystem:
             return
         
         # 检查当前持仓数量
-        positions = self.trading_state.get_all_positions()
+        positions = self.state.get_all_positions()
         max_positions = self.config.strategy.max_concurrent_positions
         if len(positions) >= max_positions:
             logger.warning(
@@ -317,11 +317,15 @@ class TradingSystem:
             from core.state import Position
             import uuid
             
+            # 确定持仓方向
+            is_call = event.contract.right == "C"
+            direction = "LONG_CALL" if is_call else "LONG_PUT"
+            
             position = Position(
                 id=str(uuid.uuid4()),
                 contract_id=event.contract.conId,
                 contract_symbol=event.contract_symbol,
-                direction="LONG_CALL" if event.contract.right == "C" else "LONG_PUT",
+                direction=direction,
                 quantity=event.quantity,
                 entry_price=event.fill_price,
                 current_price=event.fill_price,
@@ -330,6 +334,11 @@ class TradingSystem:
             )
             
             await self.state.add_position(position)
+            
+            # 更新 TradingEngine 的持仓方向状态
+            if self.trading_engine:
+                self.trading_engine.state.current_position_direction = "CALL" if is_call else "PUT"
+                logger.info(f"Position direction updated: {self.trading_engine.state.current_position_direction}")
             
             # 添加到止损监控
             self.stop_manager.add_position(position, event.contract)
@@ -363,6 +372,14 @@ class TradingSystem:
                     trade.realized_pnl_pct = (event.fill_price - position.entry_price) / position.entry_price
                     
                     await self.state.add_trade(trade)
+                    
+                    # 清除 TradingEngine 的持仓方向状态
+                    if self.trading_engine:
+                        # 检查是否还有其他持仓
+                        remaining = self.state.get_all_positions()
+                        if not remaining:
+                            self.trading_engine.state.current_position_direction = ""
+                            logger.info("Position direction cleared (no remaining positions)")
                     
                     # 更新熔断器
                     await self.circuit_breaker.record_trade_result(

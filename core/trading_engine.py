@@ -106,6 +106,9 @@ class EngineState:
     last_signal_direction: str = ""
     in_breakout: bool = False  # 是否处于突破状态
     
+    # 持仓方向过滤
+    current_position_direction: str = ""  # "CALL" / "PUT" / "" (无持仓)
+    
     # 数据缓存
     signal_bars: pd.DataFrame = field(default_factory=pd.DataFrame)  # 信号周期K线
     trend_bars: pd.DataFrame = field(default_factory=pd.DataFrame)   # 趋势周期K线
@@ -525,6 +528,8 @@ class TradingEngine:
         1. 只在首次突破时发信号（不是每个 tick）
         2. 价格回到通道内时重置状态
         3. 信号冷却期内不发信号
+        4. 已有同方向持仓时不重复开仓
+        5. NEUTRAL 趋势时允许双向突破
         """
         channel = self.state.current_channel
         trend = self.state.current_trend
@@ -558,14 +563,26 @@ class TradingEngine:
         
         # 检查向上突破 (首次突破)
         if is_above_upper and self.state.last_signal_direction != "UP":
-            if trend.is_bullish or (trend.direction == "NEUTRAL" and trend.slope > 0):
+            # 持仓过滤：已有 CALL 持仓时不再开 CALL
+            if self.state.current_position_direction == "CALL":
+                logger.debug(f"Breakout UP blocked: Already holding CALL position")
+                return
+            
+            # 趋势条件放宽：NEUTRAL 时也允许突破
+            if trend.is_bullish or trend.direction == "NEUTRAL":
                 self.state.in_breakout = True
                 self.state.last_signal_direction = "UP"
                 self._emit_signal("LONG_CALL", price, channel, trend, "breakout_up")
         
         # 检查向下突破 (首次突破)
         elif is_below_lower and self.state.last_signal_direction != "DOWN":
-            if trend.is_bearish or (trend.direction == "NEUTRAL" and trend.slope < 0):
+            # 持仓过滤：已有 PUT 持仓时不再开 PUT
+            if self.state.current_position_direction == "PUT":
+                logger.debug(f"Breakout DOWN blocked: Already holding PUT position")
+                return
+            
+            # 趋势条件放宽：NEUTRAL 时也允许突破
+            if trend.is_bearish or trend.direction == "NEUTRAL":
                 self.state.in_breakout = True
                 self.state.last_signal_direction = "DOWN"
                 self._emit_signal("LONG_PUT", price, channel, trend, "breakout_down")
@@ -649,12 +666,18 @@ class TradingEngine:
             # 如果信号周期K线完成，更新通道
             if signal_completed:
                 self._update_channel()
-                logger.debug(f"Channel updated: [{self.state.current_channel.lower:.2f}, {self.state.current_channel.upper:.2f}]")
+                channel = self.state.current_channel
+                spx = self.state.spx_price
+                logger.info(
+                    f"📊 Channel updated: [{channel.lower:.2f}, {channel.upper:.2f}] "
+                    f"| SPX=${spx:.2f} "
+                    f"| {'↑ ABOVE' if spx > channel.upper else '↓ BELOW' if spx < channel.lower else '→ INSIDE'}"
+                )
             
             # 如果趋势周期K线完成，更新趋势
             if trend_completed:
                 self._update_trend()
-                logger.debug(f"Trend updated: {self.state.current_trend.direction} (slope={self.state.current_trend.slope:.6f})")
+                logger.info(f"📈 Trend updated: {self.state.current_trend.direction} (slope={self.state.current_trend.slope:.6f})")
                 
         except Exception as e:
             logger.error(f"Error processing realtime bar: {e}")

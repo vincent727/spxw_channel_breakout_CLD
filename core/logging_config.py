@@ -111,12 +111,27 @@ def setup_logging(
     root_logger.addHandler(error_handler)
     
     # 降低第三方库的日志级别
-    logging.getLogger('ib_insync').setLevel(logging.INFO)
+    logging.getLogger('ib_insync').setLevel(logging.WARNING)  # 减少 IBKR 日志噪音
+    logging.getLogger('ib_insync.wrapper').setLevel(logging.WARNING)  # 减少 portfolio 更新
     logging.getLogger('asyncio').setLevel(logging.WARNING)
     logging.getLogger('aiosqlite').setLevel(logging.WARNING)
     logging.getLogger('nicegui').setLevel(logging.WARNING)
     logging.getLogger('uvicorn').setLevel(logging.WARNING)
     logging.getLogger('uvicorn.access').setLevel(logging.WARNING)
+    
+    # 减少内部模块的 DEBUG 噪音（控制台只显示 INFO，文件保留 DEBUG）
+    noisy_modules = [
+        'execution.ib_adapter',      # resolve_option_contract 太多
+        'execution.option_pool',     # Pool refresh 太频繁
+        'core.event_bus',            # subscribe 事件
+        'strategy.channel_breakout', # 指标计算
+    ]
+    for module in noisy_modules:
+        mod_logger = logging.getLogger(module)
+        # 文件仍然记录 DEBUG，但控制台只记录 INFO
+        for handler in mod_logger.handlers:
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, TimedRotatingFileHandler):
+                handler.setLevel(logging.INFO)
     
     logging.info(f"Logging initialized: {log_file}")
     logging.info(f"Trade log: {trade_log_file}")
