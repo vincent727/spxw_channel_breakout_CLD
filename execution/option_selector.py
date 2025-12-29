@@ -3,6 +3,10 @@
 
 SPXW 0DTE 期权自动交易系统 V4
 
+SPXW Tick Size 规则:
+- 价格 < $3.00: 最小变动 $0.05
+- 价格 >= $3.00: 最小变动 $0.10
+
 职责:
 1. 根据信号选择合适的期权合约
 2. 流动性验证
@@ -20,6 +24,7 @@ from ib_insync import Contract, Ticker
 
 from core.config import OptionSelectionConfig, LiquidityConfig
 from core.events import SignalEvent
+from .price_utils import align_buy_price
 
 logger = logging.getLogger(__name__)
 
@@ -377,22 +382,23 @@ class OptionSelector:
         aggressive: bool = False
     ) -> float:
         """
-        计算入场价格
+        计算入场价格 (使用 SPXW tick size 对齐)
         
         Args:
             candidate: 期权候选
             aggressive: 是否激进（更快成交）
         
         Returns:
-            建议的限价
+            对齐到有效 tick size 的限价
         """
         if aggressive:
-            # 激进: 直接用 Ask 确保成交
-            return candidate.ask
+            # 激进: 直接用 Ask 确保成交 (Ask 应该已经是有效价格)
+            return align_buy_price(candidate.ask)
         else:
-            # 保守: Mid + buffer
-            buffer = self.config.limit_price_buffer
-            return round(candidate.mid + buffer, 2)
+            # 保守: Mid + buffer，然后对齐到 tick size
+            buffer = getattr(self.config, 'limit_price_buffer', 0.05)
+            raw_price = candidate.mid + buffer
+            return align_buy_price(raw_price)
     
     def validate_contract_for_trade(
         self,

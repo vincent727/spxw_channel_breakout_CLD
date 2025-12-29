@@ -11,6 +11,10 @@ SPXW 0DTE 期权自动交易系统 V4
 Phase 1: 激进限价 - 穿透买一价争取快速成交
 Phase 2: 动态追单 - 追踪市场下跌，修改订单价格
 Phase 3: 紧急抛售 - 深度限价或最后手段市价单
+
+SPXW Tick Size 规则:
+- 价格 < $3.00: 最小变动 $0.05
+- 价格 >= $3.00: 最小变动 $0.10
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from core.events import (
 )
 from core.config import ChaseStopConfig
 from core.state import Position
+from execution.price_utils import align_sell_price
 
 logger = logging.getLogger(__name__)
 
@@ -224,12 +229,12 @@ class DynamicChaseStopExecutor:
         ticker = await self._get_fresh_quote(position.contract)
         current_bid = ticker.bid if ticker.bid else 0
         
-        # 计算限价
-        limit_price = round(current_bid - self.config.initial_buffer, 2)
-        limit_price = max(limit_price, 0.01)
+        # 计算限价 (使用 SPXW tick size 对齐)
+        raw_price = current_bid - self.config.initial_buffer
+        limit_price = align_sell_price(max(raw_price, 0.05))  # 最低 $0.05
         
         logger.info(
-            f"Phase 1 AGGRESSIVE: Bid=${current_bid:.2f} → Limit=${limit_price:.2f}"
+            f"Phase 1 AGGRESSIVE: Bid=${current_bid:.2f} → Limit=${limit_price:.2f} (tick-aligned)"
         )
         
         # 创建限价单
@@ -328,13 +333,14 @@ class DynamicChaseStopExecutor:
                 
                 # 如果市场已跌破我们的限价，追单
                 if current_bid < current_order_price - 0.01:  # 加容差避免频繁修改
-                    new_price = round(current_bid - self.config.chase_buffer, 2)
-                    new_price = max(new_price, 0.01)
+                    # 使用 SPXW tick size 对齐
+                    raw_price = current_bid - self.config.chase_buffer
+                    new_price = align_sell_price(max(raw_price, 0.05))  # 最低 $0.05
                     
                     logger.info(
                         f"Phase 2 CHASE #{state.chase_count + 1}: "
                         f"Bid=${current_bid:.2f} < Order=${current_order_price:.2f} → "
-                        f"New=${new_price:.2f}"
+                        f"New=${new_price:.2f} (tick-aligned)"
                     )
                     
                     # 修改订单（不是撤单重发！保留队列优先级）
@@ -394,12 +400,13 @@ class DynamicChaseStopExecutor:
         
         # === Deep Marketable Limit ===
         
-        panic_price = round(current_bid * self.config.panic_price_factor, 2)
-        panic_price = max(panic_price, 0.01)
+        # 使用 SPXW tick size 对齐
+        raw_panic_price = current_bid * self.config.panic_price_factor
+        panic_price = align_sell_price(max(raw_panic_price, 0.05))  # 最低 $0.05
         
         logger.warning(
             f"🚨 Phase 3 PANIC: Bid=${current_bid:.2f} → "
-            f"Panic Price=${panic_price:.2f} ({self.config.panic_price_factor:.0%})"
+            f"Panic Price=${panic_price:.2f} ({self.config.panic_price_factor:.0%}, tick-aligned)"
         )
         
         # 修改订单为 Panic 价格

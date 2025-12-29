@@ -278,8 +278,17 @@ class TradingSystem:
             logger.warning("No suitable option found for signal")
             return
         
-        # 计算价格
-        entry_price = self.option_selector.calculate_entry_price(candidate)
+        # 计算入场价格（使用 SPXW tick size 对齐）
+        from execution.price_utils import calculate_entry_price
+        entry_price = calculate_entry_price(
+            mid=candidate.mid,
+            buffer=self.config.execution.limit_price_buffer
+        )
+        
+        logger.info(
+            f"Entry price: mid=${candidate.mid:.2f} + buffer=${self.config.execution.limit_price_buffer:.2f} "
+            f"-> aligned=${entry_price:.2f}"
+        )
         
         # 下单
         order_ctx = await self.order_manager.submit_buy_order(

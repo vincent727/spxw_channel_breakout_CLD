@@ -101,6 +101,11 @@ class EngineState:
     spx_price: float = 0.0
     last_tick_time: Optional[datetime] = None
     
+    # 信号冷却状态
+    last_signal_time: Optional[datetime] = None
+    last_signal_direction: str = ""
+    in_breakout: bool = False  # 是否处于突破状态
+    
     # 数据缓存
     signal_bars: pd.DataFrame = field(default_factory=pd.DataFrame)  # 信号周期K线
     trend_bars: pd.DataFrame = field(default_factory=pd.DataFrame)   # 趋势周期K线
@@ -408,29 +413,36 @@ class TradingEngine:
             return False
         
         # 订阅 5 秒实时K线
-        try:
-            bars = self.ib_adapter.ib.reqRealTimeBars(
-                self._spx_contract,
-                barSize=5,
-                whatToShow='TRADES',
-                useRTH=False
-            )
-            bars.updateEvent += self._on_realtime_bar
-            self._realtime_bars_subscribed = True
-            logger.info("Subscribed to 5-second realtime bars")
-        except Exception as e:
-            logger.error(f"Failed to subscribe realtime bars: {e}")
-            return False
+        if not self._realtime_bars_subscribed:
+            try:
+                bars = self.ib_adapter.ib.reqRealTimeBars(
+                    self._spx_contract,
+                    barSize=5,
+                    whatToShow='TRADES',
+                    useRTH=False
+                )
+                bars.updateEvent += self._on_realtime_bar
+                self._realtime_bars_subscribed = True
+                logger.info("Subscribed to 5-second realtime bars")
+            except Exception as e:
+                logger.error(f"Failed to subscribe realtime bars: {e}")
+                return False
         
-        # 订阅 Tick 数据
-        try:
-            ticker = await self.ib_adapter.subscribe_market_data(self._spx_contract)
-            if ticker:
-                ticker.updateEvent += self._on_tick_update
-                self._tick_subscribed = True
-                logger.info("Subscribed to tick data")
-        except Exception as e:
-            logger.error(f"Failed to subscribe tick data: {e}")
+        # 订阅 Tick 数据 (检查是否已订阅)
+        if not self._tick_subscribed:
+            try:
+                # 检查是否已经有活跃订阅
+                ticker = self.ib_adapter.active_subscriptions.get(self._spx_contract.conId)
+                if not ticker:
+                    ticker = await self.ib_adapter.subscribe_market_data(self._spx_contract)
+                
+                if ticker:
+                    # 只添加一次回调
+                    ticker.updateEvent += self._on_tick_update
+                    self._tick_subscribed = True
+                    logger.info("Subscribed to tick data")
+            except Exception as e:
+                logger.error(f"Failed to subscribe tick data: {e}")
         
         self.state.phase = EnginePhase.SUBSCRIBED
         
@@ -509,7 +521,10 @@ class TradingEngine:
         """
         检查突破信号 - 使用预计算的通道和趋势
         
-        关键: 不等待新K线，直接使用 current_channel
+        关键设计:
+        1. 只在首次突破时发信号（不是每个 tick）
+        2. 价格回到通道内时重置状态
+        3. 信号冷却期内不发信号
         """
         channel = self.state.current_channel
         trend = self.state.current_trend
@@ -517,14 +532,42 @@ class TradingEngine:
         if not channel.is_valid:
             return
         
-        # 检查向上突破
-        if price > channel.upper:
+        # 检查信号冷却期 (使用配置中的 signal_lock_seconds)
+        if self.state.last_signal_time:
+            elapsed = (datetime.now() - self.state.last_signal_time).total_seconds()
+            if elapsed < self._signal_lock_seconds:
+                return
+        
+        # 判断当前位置
+        is_above_upper = price > channel.upper
+        is_below_lower = price < channel.lower
+        is_inside_channel = channel.lower <= price <= channel.upper
+        
+        # 如果价格回到通道内，重置突破状态
+        if is_inside_channel:
+            if self.state.in_breakout:
+                self.state.in_breakout = False
+                self.state.last_signal_direction = ""
+            return
+        
+        # 如果已经在突破状态且方向相同，不重复发信号
+        if self.state.in_breakout:
+            if (is_above_upper and self.state.last_signal_direction == "UP") or \
+               (is_below_lower and self.state.last_signal_direction == "DOWN"):
+                return
+        
+        # 检查向上突破 (首次突破)
+        if is_above_upper and self.state.last_signal_direction != "UP":
             if trend.is_bullish or (trend.direction == "NEUTRAL" and trend.slope > 0):
+                self.state.in_breakout = True
+                self.state.last_signal_direction = "UP"
                 self._emit_signal("LONG_CALL", price, channel, trend, "breakout_up")
         
-        # 检查向下突破
-        elif price < channel.lower:
+        # 检查向下突破 (首次突破)
+        elif is_below_lower and self.state.last_signal_direction != "DOWN":
             if trend.is_bearish or (trend.direction == "NEUTRAL" and trend.slope < 0):
+                self.state.in_breakout = True
+                self.state.last_signal_direction = "DOWN"
                 self._emit_signal("LONG_PUT", price, channel, trend, "breakout_down")
     
     def _emit_signal(
@@ -536,6 +579,9 @@ class TradingEngine:
         reason: str
     ) -> None:
         """发出交易信号"""
+        # 更新信号时间（用于冷却机制）
+        self.state.last_signal_time = datetime.now()
+        
         logger.info(
             f"📈 SIGNAL: {signal_type} | "
             f"Price=${price:.2f} | "
@@ -561,7 +607,7 @@ class TradingEngine:
         # 同步发布 (因为在回调中)
         self.event_bus.publish_sync(signal_event)
         
-        # 调用回调
+        # 调用回调 (已移除，信号通过 event_bus 传递)
         for callback in self._signal_callbacks:
             try:
                 callback(signal_event)

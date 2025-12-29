@@ -8,11 +8,16 @@ SPXW 0DTE 期权自动交易系统 V4
 2. 禁止任何可能产生裸空头寸的操作
 3. 卖出前必须验证持仓
 
+SPXW Tick Size 规则:
+- 价格 < $3.00: 最小变动 $0.05
+- 价格 >= $3.00: 最小变动 $0.10
+
 职责:
 1. 订单创建和提交
 2. 订单状态跟踪
 3. 买方验证
 4. 订单执行回调
+5. 价格 tick size 对齐
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from core.events import (
 )
 from core.state import TradingState, Position, OrderRecord
 from core.config import ExecutionConfig
+from .price_utils import align_buy_price, align_sell_price, is_valid_price
 
 logger = logging.getLogger(__name__)
 
@@ -219,12 +225,19 @@ class OrderManager:
             ))
             return None
         
-        # 创建订单
+        # 对齐限价到 SPXW tick size
+        aligned_price = None
         if limit_price and self.config.order_type == "LMT":
+            aligned_price = align_buy_price(limit_price)
+            if aligned_price != limit_price:
+                logger.debug(f"Price aligned: ${limit_price:.2f} → ${aligned_price:.2f}")
+        
+        # 创建订单
+        if aligned_price and self.config.order_type == "LMT":
             order = LimitOrder(
                 action="BUY",
                 totalQuantity=quantity,
-                lmtPrice=limit_price,
+                lmtPrice=aligned_price,
                 tif="DAY",
                 transmit=True
             )
@@ -244,8 +257,9 @@ class OrderManager:
             logger.error(f"Failed to submit buy order for {contract.localSymbol}")
             return None
         
-        # 创建上下文
+        # 创建上下文 (使用对齐后的价格)
         request_id = str(uuid.uuid4())
+        final_price = aligned_price if aligned_price else limit_price
         context = OrderContext(
             order_id=trade.order.orderId,
             request_id=request_id,
@@ -253,7 +267,7 @@ class OrderManager:
             action="BUY",
             quantity=quantity,
             order_type=order_type,
-            limit_price=limit_price,
+            limit_price=final_price,
             position_id=None,
             is_stop_order=False,
             submit_time=datetime.now(),
@@ -275,14 +289,14 @@ class OrderManager:
             action="BUY",
             order_type=order_type,
             quantity=quantity,
-            limit_price=limit_price or 0,
+            limit_price=final_price or 0,
             status="Submitted",
             submit_time=datetime.now()
         ))
         
         logger.info(
             f"Buy order submitted: {contract.localSymbol} "
-            f"Qty={quantity} @ ${limit_price or 'MKT'}"
+            f"Qty={quantity} @ ${final_price or 'MKT'}"
         )
         
         return context
@@ -324,12 +338,19 @@ class OrderManager:
             ))
             return None
         
-        # 创建订单
+        # 对齐限价到 SPXW tick size
+        aligned_price = None
         if limit_price:
+            aligned_price = align_sell_price(limit_price)
+            if aligned_price != limit_price:
+                logger.debug(f"Sell price aligned: ${limit_price:.2f} → ${aligned_price:.2f}")
+        
+        # 创建订单
+        if aligned_price:
             order = LimitOrder(
                 action="SELL",
                 totalQuantity=quantity,
-                lmtPrice=limit_price,
+                lmtPrice=aligned_price,
                 tif="GTC",  # 止损订单用 GTC
                 transmit=True
             )
@@ -354,8 +375,9 @@ class OrderManager:
             logger.error(f"Failed to submit sell order for {contract.localSymbol}")
             return None
         
-        # 创建上下文
+        # 创建上下文 (使用对齐后的价格)
         request_id = str(uuid.uuid4())
+        final_price = aligned_price if aligned_price else limit_price
         context = OrderContext(
             order_id=trade.order.orderId,
             request_id=request_id,
@@ -363,7 +385,7 @@ class OrderManager:
             action="SELL",
             quantity=quantity,
             order_type=order_type,
-            limit_price=limit_price,
+            limit_price=final_price,
             position_id=position_id,
             is_stop_order=is_stop_order,
             submit_time=datetime.now(),
@@ -385,7 +407,7 @@ class OrderManager:
             action="SELL",
             order_type=order_type,
             quantity=quantity,
-            limit_price=limit_price or 0,
+            limit_price=final_price or 0,
             status="Submitted",
             position_id=position_id,
             is_stop_order=is_stop_order,
@@ -394,7 +416,7 @@ class OrderManager:
         
         logger.info(
             f"Sell order submitted: {contract.localSymbol} "
-            f"Qty={quantity} @ ${limit_price or 'MKT'} "
+            f"Qty={quantity} @ ${final_price or 'MKT'} "
             f"{'(STOP)' if is_stop_order else ''}"
         )
         
