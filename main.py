@@ -111,6 +111,7 @@ class TradingSystem:
         # 运行状态
         self._running: bool = False
         self._stopped: bool = False  # 防止重复调用 stop()
+        self._eod_close_triggered: bool = False  # EOD 平仓是否已触发
         self._stop_lock: Optional[asyncio.Lock] = None  # 保护 stop() 方法
         # 惰性初始化：在 initialize() 中创建，确保绑定到正确的事件循环
         self._shutdown_event: Optional[asyncio.Event] = None
@@ -543,6 +544,9 @@ class TradingSystem:
     
     async def _main_loop(self) -> None:
         """主事件循环"""
+        eod_check_interval = 30  # 每 30 秒检查一次 EOD
+        last_eod_check = 0
+        
         while self._running:
             try:
                 # 让 IB 处理事件
@@ -552,11 +556,144 @@ class TradingSystem:
                 if self._shutdown_event is not None and self._shutdown_event.is_set():
                     break
                 
+                # 定期检查 EOD 强制平仓
+                import time
+                now = time.time()
+                if now - last_eod_check >= eod_check_interval:
+                    last_eod_check = now
+                    await self._check_and_execute_eod_close()
+                
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 await asyncio.sleep(1)
+    
+    async def _check_and_execute_eod_close(self) -> None:
+        """
+        检查是否需要 EOD 强制平仓
+        
+        在收盘前 market_close_buffer_minutes 分钟内，强制平掉所有持仓
+        """
+        # 如果已经触发过 EOD 平仓，不再重复
+        if self._eod_close_triggered:
+            return
+        
+        from core.calendar import get_trading_calendar
+        
+        calendar = get_trading_calendar()
+        
+        # 获取距离收盘的秒数
+        seconds_to_close = calendar.seconds_to_market_close()
+        if seconds_to_close is None or seconds_to_close < 0:
+            return  # 不是交易日或已收盘
+        
+        buffer_seconds = self.config.risk.market_close_buffer_minutes * 60
+        
+        # 如果距离收盘时间 <= buffer，触发 EOD 平仓
+        if seconds_to_close <= buffer_seconds:
+            positions = self.state.get_all_positions()
+            minutes_left = seconds_to_close / 60
+            
+            if not positions:
+                # 没有持仓，记录并触发退出
+                if not self._eod_close_triggered:
+                    self._eod_close_triggered = True
+                    logger.info(f"⏰ EOD window active ({minutes_left:.1f} min to close) - No positions to close")
+                    # 无持仓也触发优雅退出
+                    await self._trigger_eod_shutdown()
+                return
+            
+            # 标记 EOD 已触发
+            self._eod_close_triggered = True
+            
+            logger.warning(
+                f"⏰ EOD CLOSE TRIGGERED: {minutes_left:.1f} minutes to market close, "
+                f"force closing {len(positions)} position(s)"
+            )
+            
+            # 对每个持仓执行止损
+            for position in positions:
+                if position.id in self.stop_manager.executing_stops:
+                    logger.info(f"Position {position.id[:8]}... already executing stop")
+                    continue
+                
+                # 获取监控中的持仓信息
+                monitored = self.stop_manager.monitored_positions.get(position.id)
+                if not monitored:
+                    logger.warning(f"Position {position.id[:8]}... not in stop monitoring")
+                    continue
+                
+                # 获取当前价格
+                current_price = monitored.last_valid_price
+                if not current_price:
+                    logger.warning(f"No valid price for {position.contract_symbol}")
+                    continue
+                
+                pnl_pct = (current_price - position.entry_price) / position.entry_price
+                logger.info(
+                    f"EOD closing: {position.contract_symbol} "
+                    f"Entry=${position.entry_price:.2f} Current=${current_price:.2f} "
+                    f"PnL={pnl_pct:.1%}"
+                )
+                
+                # 使用 chase_stop_executor 执行平仓
+                from risk.chase_stop_executor import PositionStop
+                
+                position_stop = PositionStop(
+                    id=position.id,
+                    contract=monitored.contract,
+                    contract_id=monitored.contract.conId,
+                    quantity=position.quantity,
+                    entry_price=position.entry_price,
+                    highest_price=monitored.highest_price,
+                    breakeven_active=monitored.breakeven_active,
+                    breakeven_price=monitored.breakeven_price,
+                    trailing_active=monitored.trailing_active
+                )
+                
+                # 标记正在执行
+                self.stop_manager.executing_stops.add(position.id)
+                
+                try:
+                    result = await self.chase_executor.execute_stop(
+                        position_stop,
+                        current_price
+                    )
+                    
+                    if result.success:
+                        self.stop_manager.remove_position(position.id)
+                        await self.state.close_position(position.id)
+                        logger.info(f"✅ EOD close complete: {position.contract_symbol}")
+                    else:
+                        logger.error(f"❌ EOD close failed: {position.contract_symbol} phase={result.phase}")
+                finally:
+                    self.stop_manager.executing_stops.discard(position.id)
+            
+            # EOD 平仓完成后，触发优雅退出
+            await self._trigger_eod_shutdown()
+    
+    async def _trigger_eod_shutdown(self) -> None:
+        """EOD 平仓完成后触发优雅退出"""
+        logger.info("=" * 60)
+        logger.info("🏁 EOD CLOSE COMPLETE - Initiating graceful shutdown")
+        logger.info("=" * 60)
+        
+        # 等待一小段时间确保所有事件处理完成
+        await asyncio.sleep(2)
+        
+        # 触发系统关闭
+        await self.stop()
+        
+        # 如果是 NiceGUI 模式，需要关闭应用
+        try:
+            from nicegui import app
+            logger.info("Shutting down NiceGUI application...")
+            app.shutdown()
+        except Exception as e:
+            logger.debug(f"NiceGUI shutdown: {e}")
+        
+        logger.info("EOD shutdown complete")
     
     async def stop(self) -> None:
         """停止交易系统"""
