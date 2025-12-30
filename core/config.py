@@ -84,7 +84,7 @@ class StrategyConfig(BaseModel):
     warmup_trend_bars: int = Field(default=48, ge=10, le=200)
     
     # 通道参数
-    channel_lookback: int = Field(default=20, ge=5, le=100)
+    channel_lookback: int = Field(default=20, ge=1, le=100)
     channel_type: Literal["body", "wick"] = "body"
     
     # 趋势参数

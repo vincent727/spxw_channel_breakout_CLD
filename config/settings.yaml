@@ -70,7 +70,7 @@ strategy:
   warmup_trend_bars: 48         # 趋势周期预热数量
   
   # 通道参数
-  channel_lookback: 20
+  channel_lookback: 2
   channel_type: "body"  # body | wick
   
   # 趋势参数

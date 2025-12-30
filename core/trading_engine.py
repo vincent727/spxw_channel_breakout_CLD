@@ -109,6 +109,9 @@ class EngineState:
     # 持仓方向过滤
     current_position_direction: str = ""  # "CALL" / "PUT" / "" (无持仓)
     
+    # 止损/止盈后阻止本 bar 开仓
+    signal_blocked_until_next_bar: bool = False
+    
     # 数据缓存
     signal_bars: pd.DataFrame = field(default_factory=pd.DataFrame)  # 信号周期K线
     trend_bars: pd.DataFrame = field(default_factory=pd.DataFrame)   # 趋势周期K线
@@ -530,12 +533,26 @@ class TradingEngine:
         3. 信号冷却期内不发信号
         4. 已有同方向持仓时不重复开仓
         5. NEUTRAL 趋势时允许双向突破
+        6. 止损/止盈后本 bar 不再开仓
+        7. 开盘缓冲期内不交易
         """
         channel = self.state.current_channel
         trend = self.state.current_trend
         
         if not channel.is_valid:
             return
+        
+        # 检查止损/止盈后阻止标志
+        if self.state.signal_blocked_until_next_bar:
+            return
+        
+        # 检查开盘缓冲期 (0 = 无缓冲)
+        buffer_minutes = self.config.risk.trading_start_buffer_minutes
+        if buffer_minutes > 0:
+            calendar = get_trading_calendar()
+            seconds_since_open = calendar.seconds_since_market_open()
+            if seconds_since_open is not None and seconds_since_open < buffer_minutes * 60:
+                return
         
         # 检查信号冷却期 (使用配置中的 signal_lock_seconds)
         if self.state.last_signal_time:
@@ -665,6 +682,11 @@ class TradingEngine:
             
             # 如果信号周期K线完成，更新通道
             if signal_completed:
+                # 重置止损/止盈后的开仓阻止标志
+                if self.state.signal_blocked_until_next_bar:
+                    self.state.signal_blocked_until_next_bar = False
+                    logger.debug("Signal block cleared (new bar started)")
+                
                 self._update_channel()
                 channel = self.state.current_channel
                 spx = self.state.spx_price

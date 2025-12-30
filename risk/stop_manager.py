@@ -180,6 +180,11 @@ class StopManager:
         if not position:
             return
         
+        # 如果正在执行止损，跳过检查（避免重复日志）
+        position_id = position.position.id
+        if position_id in self.executing_stops:
+            return
+        
         # 获取价格
         price = self._get_price_from_tick(tick)
         if price is None:
@@ -193,7 +198,7 @@ class StopManager:
         
         if stop_check.triggered:
             # 双重确认
-            if self._confirm_stop_trigger(position.position.id, stop_check):
+            if self._confirm_stop_trigger(position_id, stop_check):
                 # 确认触发，执行止损
                 await self._execute_stop(position, stop_check, price)
         else:
@@ -399,7 +404,7 @@ class StopManager:
         
         # 防止重复执行
         if position_id in self.executing_stops:
-            logger.warning(f"Stop already executing for {position_id}")
+            logger.debug(f"Stop already executing for {position_id}")
             return
         
         self.executing_stops.add(position_id)

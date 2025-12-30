@@ -270,6 +270,24 @@ class TradingCalendar:
         
         return (market_close - now).total_seconds()
     
+    def seconds_since_market_open(self) -> Optional[float]:
+        """
+        开盘后经过的秒数
+        
+        Returns:
+            float: 开盘后的秒数 (负数表示未开盘)
+            None: 非交易日
+        """
+        now = self.now_et()
+        d = now.date()
+        
+        if not self.is_trading_day(d):
+            return None
+        
+        market_open, _ = self.get_market_hours(d)
+        
+        return (now - market_open).total_seconds()
+    
     def get_trading_status(self) -> dict:
         """获取交易状态概览"""
         now = self.now_et()

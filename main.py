@@ -384,6 +384,10 @@ class TradingSystem:
                         if old_direction:
                             self.trading_engine.state.current_position_direction = ""
                             logger.info(f"Position direction cleared: {old_direction} (exit filled)")
+                        
+                        # 阻止本 bar 继续开仓（等下一根 bar）
+                        self.trading_engine.state.signal_blocked_until_next_bar = True
+                        logger.info("Signal blocked until next bar (exit filled)")
                     
                     # 更新熔断器
                     await self.circuit_breaker.record_trade_result(
@@ -443,6 +447,10 @@ class TradingSystem:
                 if old_direction:
                     self.trading_engine.state.current_position_direction = ""
                     logger.info(f"Position direction cleared: {old_direction} (stop executed)")
+                
+                # 阻止本 bar 继续开仓（等下一根 bar）
+                self.trading_engine.state.signal_blocked_until_next_bar = True
+                logger.info("Signal blocked until next bar (stop executed)")
     
     async def start(self) -> None:
         """启动交易系统 - 使用 Warm-up 工作流"""
