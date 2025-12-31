@@ -580,10 +580,8 @@ class TradingEngine:
         
         # 检查向上突破 (首次突破)
         if is_above_upper and self.state.last_signal_direction != "UP":
-            # 持仓过滤：已有 CALL 持仓时不再开 CALL
-            if self.state.current_position_direction == "CALL":
-                logger.debug(f"Breakout UP blocked: Already holding CALL position")
-                return
+            # 持仓检查移至 _on_signal，这里只负责发出信号
+            # _on_signal 会处理：同方向忽略，反方向先平后开
             
             # 趋势条件放宽：NEUTRAL 时也允许突破
             if trend.is_bullish or trend.direction == "NEUTRAL":
@@ -593,10 +591,8 @@ class TradingEngine:
         
         # 检查向下突破 (首次突破)
         elif is_below_lower and self.state.last_signal_direction != "DOWN":
-            # 持仓过滤：已有 PUT 持仓时不再开 PUT
-            if self.state.current_position_direction == "PUT":
-                logger.debug(f"Breakout DOWN blocked: Already holding PUT position")
-                return
+            # 持仓检查移至 _on_signal，这里只负责发出信号
+            # _on_signal 会处理：同方向忽略，反方向先平后开
             
             # 趋势条件放宽：NEUTRAL 时也允许突破
             if trend.is_bearish or trend.direction == "NEUTRAL":

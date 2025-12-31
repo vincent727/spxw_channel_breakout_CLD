@@ -255,23 +255,47 @@ class TradingSystem:
         self.event_bus.subscribe(ConnectionEvent, self._on_connection)
     
     async def _on_signal(self, event: SignalEvent) -> None:
-        """处理交易信号"""
+        """
+        处理交易信号 - 严格单持仓控制
+        
+        规则：
+        1. 任何时候不允许同时持有 CALL 和 PUT
+        2. 最多只能持有一个持仓
+        3. 不重复开仓，反向信号时先平后开
+        """
         # 检查熔断器
         allowed, reason = self.circuit_breaker.is_trading_allowed()
         if not allowed:
             logger.warning(f"Signal blocked by circuit breaker: {reason}")
             return
         
-        # 检查当前持仓数量
-        positions = self.state.get_all_positions()
-        max_positions = self.config.strategy.max_concurrent_positions
-        if len(positions) >= max_positions:
-            logger.warning(
-                f"Signal blocked: Max positions reached ({len(positions)}/{max_positions})"
-            )
-            return
-        
         logger.info(f"Processing signal: {event.signal_type}")
+        
+        # 确定信号方向
+        signal_direction = "CALL" if event.signal_type == "LONG_CALL" else "PUT"
+        
+        # 获取当前持仓（直接查询，不依赖 current_position_direction）
+        positions = self.state.get_all_positions()
+        
+        if positions:
+            existing_position = positions[0]  # 最多只有一个
+            existing_direction = "CALL" if "C" in existing_position.contract_symbol else "PUT"
+            
+            if existing_direction == signal_direction:
+                # 同方向 → 忽略信号
+                logger.info(f"Signal ignored: Already holding {existing_direction}")
+                return
+            else:
+                # 反方向 → 先平仓再开新仓
+                logger.info(f"Reverse signal: Closing {existing_direction} to open {signal_direction}")
+                
+                # 执行反向平仓
+                closed = await self._close_for_reversal(existing_position)
+                if not closed:
+                    logger.error("Failed to close position for reversal, aborting new entry")
+                    return
+                
+                # 平仓成功，继续开新仓
         
         # 获取 SPX 价格 (优先使用事件中的价格，其次从引擎获取)
         spx_price = event.spx_price
@@ -313,6 +337,107 @@ class TradingSystem:
         
         if order_ctx:
             logger.info(f"Order submitted: {order_ctx.order_id}")
+    
+    async def _close_for_reversal(self, position) -> bool:
+        """
+        为反向开仓执行平仓
+        
+        使用 chase_stop_executor 确保成交
+        
+        Returns:
+            bool: 平仓是否成功
+        """
+        logger.info(f"Closing position for reversal: {position.contract_symbol}")
+        
+        # 从 stop_manager 获取监控信息
+        monitored = self.stop_manager.monitored_positions.get(position.id)
+        if not monitored:
+            logger.error(f"Position not found in stop_manager: {position.id}")
+            return False
+        
+        # 获取当前价格
+        current_price = monitored.last_valid_price
+        if not current_price:
+            logger.error("No valid price for reversal close")
+            return False
+        
+        # 标记为正在执行
+        self.stop_manager.executing_stops.add(position.id)
+        
+        try:
+            # 构建 PositionStop
+            from risk.chase_stop_executor import PositionStop
+            position_stop = PositionStop(
+                id=position.id,
+                contract=monitored.contract,
+                contract_id=monitored.contract.conId,
+                quantity=position.quantity,
+                entry_price=position.entry_price,
+                highest_price=monitored.highest_price,
+                breakeven_active=monitored.breakeven_active,
+                breakeven_price=monitored.breakeven_price,
+                trailing_active=monitored.trailing_active
+            )
+            
+            # 使用 chase_executor 执行平仓
+            result = await self.chase_executor.execute_stop(position_stop, current_price)
+            
+            if result.success:
+                # 计算 PnL
+                pnl = (result.fill_price - position.entry_price) * position.quantity * 100
+                pnl_pct = (result.fill_price - position.entry_price) / position.entry_price
+                
+                logger.info(
+                    f"Reversal close complete: {position.contract_symbol} "
+                    f"@ ${result.fill_price:.2f} PnL=${pnl:.2f} ({pnl_pct:.1%})"
+                )
+                
+                # 记录交易
+                from core.state import Trade
+                trade = Trade(
+                    position_id=position.id,
+                    contract_id=position.contract_id,
+                    contract_symbol=position.contract_symbol,
+                    direction=position.direction,
+                    entry_time=position.entry_time,
+                    entry_price=position.entry_price,
+                    exit_time=datetime.now(),
+                    exit_price=result.fill_price,
+                    quantity=position.quantity,
+                    realized_pnl=pnl,
+                    status="CLOSED"
+                )
+                trade.realized_pnl_pct = pnl_pct
+                await self.state.add_trade(trade)
+                
+                # 更新熔断器
+                await self.circuit_breaker.record_trade_result(pnl, pnl > 0)
+                
+                # 移除监控
+                self.stop_manager.remove_position(position.id)
+                
+                # 取消 tick 订阅
+                await self.tick_streamer.unsubscribe(monitored.contract)
+                
+                # 关闭持仓
+                await self.state.close_position(position.id)
+                
+                # 清除方向（此时无持仓）
+                if self.trading_engine:
+                    old_direction = self.trading_engine.state.current_position_direction
+                    self.trading_engine.state.current_position_direction = ""
+                    logger.info(f"Position direction cleared: {old_direction} (reversal close)")
+                
+                return True
+            else:
+                logger.error(f"Reversal close failed: phase={result.phase}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error during reversal close: {e}")
+            return False
+        finally:
+            self.stop_manager.executing_stops.discard(position.id)
     
     async def _on_fill(self, event: FillEvent) -> None:
         """处理成交"""
@@ -378,12 +503,16 @@ class TradingSystem:
                     await self.state.add_trade(trade)
                     
                     # 清除 TradingEngine 的持仓方向状态
-                    # 平仓成功，直接清除方向
+                    # 检查是否还有其他持仓
+                    remaining = self.state.get_all_positions()
+                    remaining = [p for p in remaining if p.id != event.position_id]
+                    
                     if self.trading_engine:
-                        old_direction = self.trading_engine.state.current_position_direction
-                        if old_direction:
-                            self.trading_engine.state.current_position_direction = ""
-                            logger.info(f"Position direction cleared: {old_direction} (exit filled)")
+                        if not remaining:
+                            old_direction = self.trading_engine.state.current_position_direction
+                            if old_direction:
+                                self.trading_engine.state.current_position_direction = ""
+                                logger.info(f"Position direction cleared: {old_direction} (exit filled, no remaining)")
                         
                         # 阻止本 bar 继续开仓（等下一根 bar）
                         self.trading_engine.state.signal_blocked_until_next_bar = True
@@ -441,12 +570,16 @@ class TradingSystem:
                 )
             
             # 清除 TradingEngine 的持仓方向状态
-            # 止损成功意味着持仓已平，直接清除方向
+            # 检查是否还有其他持仓
+            remaining = self.state.get_all_positions()
+            remaining = [p for p in remaining if p.id != event.position_id]
+            
             if self.trading_engine:
-                old_direction = self.trading_engine.state.current_position_direction
-                if old_direction:
-                    self.trading_engine.state.current_position_direction = ""
-                    logger.info(f"Position direction cleared: {old_direction} (stop executed)")
+                if not remaining:
+                    old_direction = self.trading_engine.state.current_position_direction
+                    if old_direction:
+                        self.trading_engine.state.current_position_direction = ""
+                        logger.info(f"Position direction cleared: {old_direction} (stop executed, no remaining)")
                 
                 # 阻止本 bar 继续开仓（等下一根 bar）
                 self.trading_engine.state.signal_blocked_until_next_bar = True

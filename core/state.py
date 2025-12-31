@@ -56,6 +56,8 @@ class Position:
     signal_id: str = ""
     entry_order_id: int = 0
     status: Literal["OPEN", "CLOSING", "CLOSED"] = "OPEN"
+    created_at: Optional[str] = None  # 数据库自动生成
+    updated_at: Optional[str] = None  # 数据库自动生成
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -104,6 +106,8 @@ class Trade:
     
     # 状态
     status: Literal["OPEN", "CLOSED"] = "OPEN"
+    created_at: Optional[str] = None  # 数据库自动生成
+    updated_at: Optional[str] = None  # 数据库自动生成
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -147,6 +151,8 @@ class OrderRecord:
     # 关联
     position_id: str = ""
     is_stop_order: bool = False
+    created_at: Optional[str] = None  # 数据库自动生成
+    updated_at: Optional[str] = None  # 数据库自动生成
 
 
 @dataclass
@@ -164,6 +170,7 @@ class DailyStats:
     avg_loss: float = 0.0
     profit_factor: float = 0.0
     created_at: Optional[str] = None  # 数据库自动生成
+    updated_at: Optional[str] = None  # 数据库自动生成
 
 
 # ============================================================================
