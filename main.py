@@ -416,8 +416,8 @@ class TradingSystem:
                 # 移除监控
                 self.stop_manager.remove_position(position.id)
                 
-                # 取消 tick 订阅
-                await self.tick_streamer.unsubscribe(monitored.contract)
+                # 取消 tick 订阅（同步方法）
+                self.tick_streamer.unsubscribe(monitored.contract)
                 
                 # 关闭持仓
                 await self.state.close_position(position.id)
