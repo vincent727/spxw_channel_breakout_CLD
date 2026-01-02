@@ -494,21 +494,59 @@ class TradingEngine:
         Tick 更新回调 - 即时处理
         
         这是 Phase 3 的核心：使用预计算的通道进行突破检查
+        
+        SPX Index 价格获取策略：
+        1. 优先使用 ticker.last（指数实时价格）
+        2. 备选使用 marketPrice()（ib_insync 计算的市场价格）
+        3. 不使用 midpoint()（指数无 bid/ask）
+        4. 不使用 close（防止用昨日价格计算今日风险）
+        5. 增加新鲜度检查（价格 >5秒 未变动视为无效）
         """
         if self.state.phase != EnginePhase.TRADING:
             return
         
         try:
-            # 获取价格
             import math
-            price = ticker.last
-            if price is None or (isinstance(price, float) and math.isnan(price)):
-                price = ticker.close
-            if price is None or (isinstance(price, float) and math.isnan(price)):
+            price = None
+            
+            # 1. 优先使用 last price（SPX 指数实时价格）
+            if ticker.last is not None and not (isinstance(ticker.last, float) and math.isnan(ticker.last)):
+                price = ticker.last
+            
+            # 2. 备选使用 marketPrice()（ib_insync 计算的市场价格）
+            if price is None:
+                try:
+                    mp = ticker.marketPrice()
+                    if mp is not None and not (isinstance(mp, float) and math.isnan(mp)):
+                        price = mp
+                except:
+                    pass
+            
+            # 如果没有有效价格，放弃本次更新
+            if price is None:
                 return
             
+            # 新鲜度检查（Staleness Check）
+            # 如果价格与上次相同且超过 5 秒未变动，视为陈旧数据
+            now = datetime.now()
+            if hasattr(self.state, '_last_price_value') and hasattr(self.state, '_last_price_change_time'):
+                if price == self.state._last_price_value:
+                    # 价格未变动，检查时间
+                    elapsed = (now - self.state._last_price_change_time).total_seconds()
+                    if elapsed > 5.0:
+                        # 价格超过 5 秒未变动，视为陈旧，不更新
+                        return
+                else:
+                    # 价格变动了，更新最后变动时间
+                    self.state._last_price_value = price
+                    self.state._last_price_change_time = now
+            else:
+                # 首次初始化
+                self.state._last_price_value = price
+                self.state._last_price_change_time = now
+            
             self.state.spx_price = price
-            self.state.last_tick_time = datetime.now()
+            self.state.last_tick_time = now
             self.state.ticks_received += 1
             
             # 使用预计算的通道检查突破
@@ -517,7 +555,7 @@ class TradingEngine:
             # 发布价格事件
             self.event_bus.publish_sync(SPXPriceEvent(
                 price=price,
-                timestamp=datetime.now()
+                timestamp=now
             ))
             
         except Exception as e:
@@ -660,6 +698,13 @@ class TradingEngine:
         
         bar = bars[-1]
         self.state.bars_received += 1
+        
+        # 更新 SPX 价格（作为 tick 数据的备份）
+        # 如果 tick 数据正常，这里会被 tick 更新覆盖
+        # 如果 tick 数据有问题，至少有 5 秒一次的价格更新
+        if hasattr(bar, 'close') and bar.close and bar.close > 0:
+            self.state.spx_price = bar.close
+            self.state.last_tick_time = datetime.now()
         
         try:
             # 聚合到信号周期
