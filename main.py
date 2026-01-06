@@ -262,6 +262,7 @@ class TradingSystem:
         1. 任何时候不允许同时持有 CALL 和 PUT
         2. 最多只能持有一个持仓
         3. 不重复开仓，反向信号时先平后开
+        4. 如果止损正在执行，忽略信号（防止重复平仓产生净空头）
         """
         # 检查熔断器
         allowed, reason = self.circuit_breaker.is_trading_allowed()
@@ -280,6 +281,15 @@ class TradingSystem:
         if positions:
             existing_position = positions[0]  # 最多只有一个
             existing_direction = "CALL" if "C" in existing_position.contract_symbol else "PUT"
+            
+            # ★ 关键检查：如果该持仓正在执行止损，忽略信号
+            # 防止止损和反转平仓同时发送卖单，导致净空头
+            if existing_position.id in self.stop_manager.executing_stops:
+                logger.warning(
+                    f"Signal ignored: Stop already executing for {existing_position.contract_symbol}. "
+                    f"Preventing duplicate sell order that could create naked short position."
+                )
+                return
             
             if existing_direction == signal_direction:
                 # 同方向 → 忽略信号
@@ -344,15 +354,48 @@ class TradingSystem:
         
         使用 chase_stop_executor 确保成交
         
+        ★ 重要：必须先检查是否已有止损在执行，防止重复卖出导致净空头
+        
         Returns:
             bool: 平仓是否成功
         """
         logger.info(f"Closing position for reversal: {position.contract_symbol}")
         
+        # ★ 关键检查：如果止损已经在执行，等待其完成
+        # 防止同一仓位被卖出两次，产生净空头
+        if position.id in self.stop_manager.executing_stops:
+            logger.warning(
+                f"Stop already executing for {position.contract_symbol}, "
+                f"waiting for completion instead of sending duplicate sell order"
+            )
+            # 等待当前止损完成（最多等待 5 秒）
+            for i in range(50):
+                await asyncio.sleep(0.1)
+                if position.id not in self.stop_manager.executing_stops:
+                    # 检查持仓是否已被平仓
+                    remaining_positions = self.state.get_all_positions()
+                    if not remaining_positions or position.id not in [p.id for p in remaining_positions]:
+                        logger.info(f"Stop completed for {position.contract_symbol}, position already closed")
+                        return True  # 止损已完成平仓，不需要再执行
+                    else:
+                        logger.warning(f"Stop completed but position still exists, continuing with reversal close")
+                        break
+            else:
+                # 超时
+                logger.error(f"Stop execution timeout for {position.contract_symbol} after 5s")
+                return False
+        
         # 从 stop_manager 获取监控信息
         monitored = self.stop_manager.monitored_positions.get(position.id)
         if not monitored:
-            logger.error(f"Position not found in stop_manager: {position.id}")
+            # 可能已经被止损移除
+            logger.warning(f"Position {position.id} not found in stop_manager, may have been closed by stop")
+            # 再次检查持仓状态
+            remaining_positions = self.state.get_all_positions()
+            if not remaining_positions or position.id not in [p.id for p in remaining_positions]:
+                logger.info(f"Position already closed, reversal close not needed")
+                return True
+            logger.error(f"Position exists but not in stop_manager: {position.id}")
             return False
         
         # 获取当前价格
@@ -361,7 +404,7 @@ class TradingSystem:
             logger.error("No valid price for reversal close")
             return False
         
-        # 标记为正在执行
+        # 标记为正在执行（此时已确认没有其他止损在执行）
         self.stop_manager.executing_stops.add(position.id)
         
         try:

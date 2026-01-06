@@ -226,7 +226,9 @@ class TradingCalendar:
         
         # 市场未开盘
         if now < market_open:
-            return False, f"Market not open yet. Opens at {market_open.strftime('%H:%M')}"
+            # 转换为美东时间显示（pandas_market_calendars 返回的可能是 UTC）
+            market_open_et = market_open.astimezone(self.tz) if market_open.tzinfo else market_open
+            return False, f"Market not open yet. Opens at {market_open_et.strftime('%H:%M')} ET"
         
         # 市场已收盘
         if now >= market_close:
