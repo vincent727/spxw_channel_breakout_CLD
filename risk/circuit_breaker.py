@@ -157,7 +157,7 @@ class CircuitBreaker:
             return
         
         # 3. 连续亏损（可配置，默认 5 次）
-        max_consecutive = getattr(self.config, 'max_consecutive_losses', 5)
+        max_consecutive = getattr(self.config, 'max_consecutive_losses', 10)
         if state.consecutive_losses >= max_consecutive:
             await self._trigger(
                 "CONSECUTIVE_LOSSES",
