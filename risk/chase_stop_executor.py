@@ -50,6 +50,7 @@ class StopResult:
     chase_count: int = 0
     duration_ms: float = 0.0
     slippage: Optional[float] = None
+    was_duplicate: bool = False
 
 
 @dataclass
@@ -137,6 +138,10 @@ class DynamicChaseStopExecutor:
         self.config = config
         self.event_bus = event_bus
         
+        # ★ 修复 5: 记录活跃止损订单，防止重复卖出
+        # position_id -> order_id 映射
+        self._active_stop_orders: Dict[str, int] = {}
+        
         logger.info(
             f"DynamicChaseStopExecutor initialized: "
             f"max_chase={config.max_chase_count}, "
@@ -208,6 +213,9 @@ class DynamicChaseStopExecutor:
         duration = (time.perf_counter() - start_time) * 1000
         await self._report_stop_result(state, state.phase, duration)
         
+        # ★ 修复 5: 清理活跃订单记录
+        self._cleanup_active_order(position.id)
+        
         # 计算盈亏
         pnl = None
         pnl_pct = None
@@ -254,7 +262,13 @@ class DynamicChaseStopExecutor:
             transmit=True
         )
         
+        # ★ 修复 5: 设置 orderRef 关联持仓 ID
+        order.orderRef = position.id
+        
         trade = self.ib.ib.placeOrder(position.contract, order)
+        
+        # ★ 修复 5: 记录活跃止损订单
+        self._active_stop_orders[position.id] = trade.order.orderId
         
         state = StopOrderState(
             order_id=trade.order.orderId,
@@ -496,9 +510,11 @@ class DynamicChaseStopExecutor:
     
     async def _check_existing_sell_orders(self, position: PositionStop) -> Optional[StopResult]:
         """
-        检查是否有同一合约的遗留卖单
+        ★ 修复 5: 检查是否有当前持仓的遗留卖单
         
         防止重复卖出导致空单！
+        
+        改进：验证 orderRef 匹配当前 position.id，避免同合约多次交易时误判
         
         Returns:
             如果找到已成交的卖单，返回 StopResult；否则返回 None
@@ -508,6 +524,16 @@ class DynamicChaseStopExecutor:
         for trade in self.ib.ib.trades():
             if (trade.contract.conId == contract_id and 
                 trade.order.action == "SELL"):
+                
+                # ★ 修复 5: 检查 orderRef 是否匹配当前持仓
+                order_ref = getattr(trade.order, 'orderRef', '')
+                if order_ref and order_ref != position.id:
+                    # 这是其他持仓的订单，跳过
+                    logger.debug(
+                        f"Found sell order {trade.order.orderId} for same contract but different position "
+                        f"(orderRef={order_ref[:8]}... vs current={position.id[:8]}...)"
+                    )
+                    continue
                 
                 status = trade.orderStatus.status
                 
@@ -519,8 +545,12 @@ class DynamicChaseStopExecutor:
                     
                     logger.warning(
                         f"⚠️ Found existing FILLED sell order for {position.contract.localSymbol} "
-                        f"@ ${fill_price:.2f}, skipping duplicate stop execution"
+                        f"@ ${fill_price:.2f} (orderRef={order_ref[:8] if order_ref else 'N/A'}...), "
+                        f"skipping duplicate stop execution"
                     )
+                    
+                    # ★ 修复 5: 清理活跃订单记录
+                    self._cleanup_active_order(position.id)
                     
                     return StopResult(
                         success=True,
@@ -529,14 +559,16 @@ class DynamicChaseStopExecutor:
                         pnl=pnl,
                         pnl_pct=pnl_pct,
                         chase_count=0,
-                        duration_ms=0
+                        duration_ms=0,
+                        was_duplicate=True
                     )
                 
                 elif status in ["PreSubmitted", "Submitted", "PendingSubmit"]:
                     # 有挂单，等待它完成
                     logger.warning(
                         f"⚠️ Found pending sell order {trade.order.orderId} for "
-                        f"{position.contract.localSymbol}, waiting for completion..."
+                        f"{position.contract.localSymbol} (orderRef={order_ref[:8] if order_ref else 'N/A'}...), "
+                        f"waiting for completion..."
                     )
                     
                     # 等待挂单完成（最多 3 秒）
@@ -553,6 +585,9 @@ class DynamicChaseStopExecutor:
                                 f"✅ Pending sell order filled @ ${fill_price:.2f}"
                             )
                             
+                            # ★ 修复 5: 清理活跃订单记录
+                            self._cleanup_active_order(position.id)
+                            
                             return StopResult(
                                 success=True,
                                 phase="DONE",
@@ -560,7 +595,8 @@ class DynamicChaseStopExecutor:
                                 pnl=pnl,
                                 pnl_pct=pnl_pct,
                                 chase_count=0,
-                                duration_ms=0
+                                duration_ms=0,
+                                was_duplicate=True
                             )
                         elif trade.orderStatus.status == "Cancelled":
                             logger.info("Pending sell order was cancelled, proceeding with new order")
@@ -631,6 +667,17 @@ class DynamicChaseStopExecutor:
         trade = self._get_trade_by_id(order_id)
         if trade and trade.orderStatus.status not in ["Filled", "Cancelled"]:
             self.ib.ib.cancelOrder(trade.order)
+    
+    def _cleanup_active_order(self, position_id: str) -> None:
+        """
+        ★ 修复 5: 清理活跃止损订单记录
+        
+        Args:
+            position_id: 持仓ID
+        """
+        if position_id in self._active_stop_orders:
+            order_id = self._active_stop_orders.pop(position_id)
+            logger.debug(f"Cleaned up active stop order {order_id} for position {position_id[:8]}...")
     
     async def _report_stop_result(
         self,

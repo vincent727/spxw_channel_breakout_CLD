@@ -44,6 +44,15 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class OrderRetryConfig:
+    """★ 修复 7: 订单重试配置"""
+    max_retries: int = 2
+    retry_delay_ms: int = 200
+    price_refresh_enabled: bool = True
+    price_adjustment_ticks: int = 1
+
+
+@dataclass
 class OrderContext:
     """订单上下文"""
     order_id: int
@@ -90,6 +99,11 @@ class OrderManager:
         
         # 活跃订单
         self.active_orders: Dict[int, OrderContext] = {}
+        
+        # ★ 修复 7: 订单重试配置和统计
+        self.retry_config = OrderRetryConfig()
+        self.rejected_order_history: List[Dict] = []
+        self.retried_orders: int = 0
         
         # 统计
         self.total_orders: int = 0
@@ -280,6 +294,10 @@ class OrderManager:
         # 注册回调 (注意: filledEvent 只传 trade，fill 从 trade.fills 获取)
         trade.statusEvent += lambda t: self._on_order_status(t, context)
         trade.filledEvent += lambda t: self._on_fill(t, context)
+        # ★ 修复 7: 注册取消/拒绝回调以支持重试
+        trade.cancelledEvent += lambda t: asyncio.create_task(
+            self._on_order_cancelled_or_rejected(t, context)
+        )
         
         # 保存订单记录
         await self.state.add_order(OrderRecord(
@@ -548,12 +566,159 @@ class OrderManager:
         """获取订单"""
         return self.active_orders.get(order_id)
     
+    def _is_retryable_rejection(self, error_message: str) -> bool:
+        """
+        ★ 修复 7: 判断订单拒绝是否可重试
+        
+        Args:
+            error_message: 拒绝原因
+            
+        Returns:
+            True if retryable
+        """
+        retryable_keywords = [
+            "limit price",
+            "aggressive",
+            "market price",
+            "cannot accept",
+            "price is not valid",
+            "price does not conform"
+        ]
+        
+        error_lower = error_message.lower()
+        return any(keyword in error_lower for keyword in retryable_keywords)
+    
+    async def _on_order_cancelled_or_rejected(
+        self,
+        trade: Trade,
+        context: OrderContext
+    ) -> None:
+        """
+        ★ 修复 7: 处理订单取消或拒绝
+        
+        Args:
+            trade: Trade对象
+            context: 订单上下文
+        """
+        status = trade.orderStatus.status
+        
+        # 记录拒绝信息
+        rejection_info = {
+            "order_id": context.order_id,
+            "contract": context.contract.localSymbol,
+            "action": context.action,
+            "quantity": context.quantity,
+            "limit_price": context.limit_price,
+            "status": status,
+            "timestamp": datetime.now()
+        }
+        
+        # 获取拒绝原因（从 trade 的最后一个错误获取）
+        # Note: ib_insync 不直接提供拒绝原因，需要从日志或其他方式获取
+        # 这里我们简化处理，假设价格相关的拒绝都可重试
+        
+        # 只对买单进行重试（卖单通常是止损，不应重试）
+        if context.action != "BUY":
+            logger.debug(f"Order {context.order_id} rejected/cancelled but not a buy order, skipping retry")
+            return
+        
+        # 检查是否已达到最大重试次数
+        retry_count = getattr(context, 'retry_count', 0)
+        if retry_count >= self.retry_config.max_retries:
+            logger.warning(
+                f"Order {context.order_id} rejected after {retry_count} retries, giving up"
+            )
+            self.rejected_order_history.append(rejection_info)
+            return
+        
+        # 对于限价单，尝试重试
+        if context.order_type == "LMT" and self.retry_config.price_refresh_enabled:
+            logger.info(
+                f"Retrying order {context.order_id} (attempt {retry_count + 1}/{self.retry_config.max_retries})"
+            )
+            
+            # 延迟后重试
+            await asyncio.sleep(self.retry_config.retry_delay_ms / 1000)
+            
+            # 刷新报价获取最新价格
+            try:
+                ticker = await self.ib.subscribe_market_data(context.contract)
+                if ticker:
+                    await asyncio.sleep(0.1)  # 等待报价更新
+                    
+                    # 获取最新买价
+                    new_mid = (ticker.bid + ticker.ask) / 2 if ticker.bid and ticker.ask else None
+                    
+                    if new_mid:
+                        # 调整价格（更激进一些）
+                        from .price_utils import calculate_entry_price
+                        # 增加 buffer 使其更激进
+                        adjusted_price = calculate_entry_price(
+                            mid=new_mid,
+                            buffer=self.config.limit_price_buffer + 0.05 * (retry_count + 1)
+                        )
+                        
+                        logger.info(
+                            f"Refreshed price: old=${context.limit_price:.2f} "
+                            f"new=${adjusted_price:.2f} (mid=${new_mid:.2f})"
+                        )
+                        
+                        # 重新提交订单
+                        order = LimitOrder(
+                            action="BUY",
+                            totalQuantity=context.quantity,
+                            lmtPrice=adjusted_price,
+                            tif="DAY",
+                            transmit=True
+                        )
+                        
+                        new_trade = await self.ib.place_order(context.contract, order)
+                        
+                        if new_trade:
+                            # 更新上下文
+                            context.order_id = new_trade.order.orderId
+                            context.limit_price = adjusted_price
+                            context.trade = new_trade
+                            setattr(context, 'retry_count', retry_count + 1)
+                            
+                            # 更新活跃订单
+                            self.active_orders[new_trade.order.orderId] = context
+                            
+                            # 注册回调
+                            new_trade.statusEvent += lambda t: self._on_order_status(t, context)
+                            new_trade.filledEvent += lambda t: self._on_fill(t, context)
+                            new_trade.cancelledEvent += lambda t: asyncio.create_task(
+                                self._on_order_cancelled_or_rejected(t, context)
+                            )
+                            
+                            self.retried_orders += 1
+                            
+                            logger.info(f"Order retry submitted: new order_id={new_trade.order.orderId}")
+                        else:
+                            logger.error("Failed to submit retry order")
+                            self.rejected_order_history.append(rejection_info)
+                    else:
+                        logger.warning("No valid price for retry")
+                        self.rejected_order_history.append(rejection_info)
+                else:
+                    logger.warning("Failed to get ticker for retry")
+                    self.rejected_order_history.append(rejection_info)
+                    
+            except Exception as e:
+                logger.error(f"Error during order retry: {e}")
+                self.rejected_order_history.append(rejection_info)
+        else:
+            logger.debug("Order retry not enabled or not applicable")
+            self.rejected_order_history.append(rejection_info)
+    
     def get_stats(self) -> Dict[str, Any]:
-        """获取统计"""
+        """★ 修复 7: 获取统计（包含重试信息）"""
         return {
             "total_orders": self.total_orders,
             "filled_orders": self.filled_orders,
             "rejected_orders": self.rejected_orders,
             "active_orders": len(self.active_orders),
-            "fill_rate": self.filled_orders / max(self.total_orders, 1)
+            "fill_rate": self.filled_orders / max(self.total_orders, 1),
+            "retried_orders": self.retried_orders,
+            "rejected_history_count": len(self.rejected_order_history)
         }

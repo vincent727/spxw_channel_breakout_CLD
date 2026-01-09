@@ -32,6 +32,12 @@ from core.calendar import get_trading_calendar, get_0dte_expiry
 
 logger = logging.getLogger(__name__)
 
+# ★ 修复 8: IBKR 错误代码分类
+# 信息性消息 - 仅用于调试
+IBKR_INFO_CODES = {2104, 2106, 2158, 2119}
+# 警告消息 - 仅用于调试
+IBKR_WARNING_CODES = {10167, 10168, 399}
+
 
 class IBAdapter:
     """
@@ -231,7 +237,19 @@ class IBAdapter:
         errorString: str,
         contract: Contract
     ) -> None:
-        """错误处理回调"""
+        """
+        ★ 修复 8: 错误处理回调 - 区分信息/警告/错误
+        """
+        # ★ 修复 8: 信息性消息 - 使用 debug 级别
+        if errorCode in IBKR_INFO_CODES:
+            logger.debug(f"IBKR INFO {errorCode}: {errorString}")
+            return
+        
+        # ★ 修复 8: 警告消息 - 使用 debug 级别
+        if errorCode in IBKR_WARNING_CODES:
+            logger.debug(f"IBKR WARNING {errorCode}: {errorString}")
+            return
+        
         # Pacing Violation 错误
         if errorCode in [162, 10090, 10091]:
             logger.warning(f"PACING VIOLATION: {errorCode} - {errorString}")

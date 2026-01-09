@@ -71,6 +71,14 @@ from .calendar import (
     is_trading_allowed,
 )
 
+from .state_logger import (
+    StateLogger,
+    StateChange,
+    StateChangeType,
+    get_state_logger,
+    set_state_logger,
+)
+
 __all__ = [
     # Config
     'TradingConfig',
@@ -133,4 +141,11 @@ __all__ = [
     'get_trading_calendar',
     'get_0dte_expiry',
     'is_trading_allowed',
+    
+    # State Logger
+    'StateLogger',
+    'StateChange',
+    'StateChangeType',
+    'get_state_logger',
+    'set_state_logger',
 ]
