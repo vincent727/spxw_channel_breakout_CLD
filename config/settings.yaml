@@ -70,7 +70,7 @@ strategy:
   warmup_trend_bars: 48         # 趋势周期预热数量
   
   # 通道参数
-  channel_lookback: 10
+  channel_lookback: 5
   channel_type: "body"  # body | wick
   
   # 趋势参数
@@ -111,6 +111,11 @@ execution:
   max_position: 5
   max_premium_per_trade: 500
   
+  # 仓位计算：固定投入金额
+  # 如果 > 0，根据期权价格计算手数：手数 = floor(金额 / (价格 * 100))，不到1手按1手
+  # 如果 = 0，使用固定的 position_size
+  fixed_investment_amount: 1000.0
+  
   # 买方保护 - CRITICAL
   enforce_long_only: true
 
@@ -143,7 +148,7 @@ risk:
     
     # Phase 3: 紧急抛售
     panic_loss_threshold: 0.40
-    panic_price_factor: 0.80
+    panic_price_factor: 0.95
     abandon_price_threshold: 0.20
     
     # 最后手段

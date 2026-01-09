@@ -160,6 +160,14 @@ class DynamicChaseStopExecutor:
         """
         start_time = time.perf_counter()
         
+        # ★ 关键保护：检查是否有同一合约的遗留卖单
+        # 防止重复卖出导致空单
+        existing_result = await self._check_existing_sell_orders(position)
+        if existing_result:
+            duration = (time.perf_counter() - start_time) * 1000
+            existing_result.duration_ms = duration
+            return existing_result
+        
         logger.warning(
             f"🛑 STOP TRIGGERED: {position.contract.localSymbol} | "
             f"Entry=${position.entry_price:.2f} → Trigger=${trigger_price:.2f} | "
@@ -363,10 +371,21 @@ class DynamicChaseStopExecutor:
         
         策略:
         1. 如果 Bid <= 放弃阈值: 放弃止损，保留仓位（赌反转或归零）
-        2. 否则: 深度限价 (Bid * 0.80)
+        2. 否则: 深度限价 (Bid * 0.95)
         3. 最后手段: 市价单
         """
         position = state.position
+        
+        # ★ 首先检查 Phase 1/2 的订单是否已经成交
+        trade = self._get_trade_by_id(state.order_id)
+        if trade:
+            await self.ib.sleep(0)  # 刷新状态
+            if trade.orderStatus.status == "Filled":
+                state.phase = "DONE"
+                state.fill_price = trade.orderStatus.avgFillPrice
+                logger.info(f"✅ Order already filled before Phase 3 @ ${state.fill_price:.2f}")
+                return state
+        
         ticker = await self._get_fresh_quote(position.contract)
         current_bid = ticker.bid if ticker.bid else 0
         
@@ -379,8 +398,8 @@ class DynamicChaseStopExecutor:
                 f"Holding position for potential reversal or expiry"
             )
             
-            # 取消订单
-            self._cancel_order(state.order_id)
+            # 取消订单并等待
+            await self._cancel_order_and_wait(state.order_id, timeout_sec=0.5)
             state.phase = "ABANDONED"
             
             # 发送通知
@@ -432,12 +451,23 @@ class DynamicChaseStopExecutor:
         if self.config.enable_market_fallback:
             logger.error("🆘 Phase 3 LAST RESORT: Submitting MARKET order")
             
-            self._cancel_order(state.order_id)
-            await asyncio.sleep(0.1)
+            # ★ 等待取消完成，防止重复卖出
+            cancel_success = await self._cancel_order_and_wait(state.order_id, timeout_sec=0.5)
             
+            if not cancel_success:
+                # 限价单可能已成交
+                trade = self._get_trade_by_id(state.order_id)
+                if trade and trade.orderStatus.status == "Filled":
+                    state.phase = "DONE"
+                    state.fill_price = trade.orderStatus.avgFillPrice
+                    logger.info(f"✅ Limit order filled during cancel @ ${state.fill_price:.2f}")
+                    return state
+            
+            # ★ 使用 IOC (Immediate or Cancel) 避免 TWS 预设冲突
             mkt_order = MarketOrder(
                 action="SELL",
                 totalQuantity=position.quantity,
+                tif='IOC',
                 transmit=True
             )
             
@@ -463,6 +493,124 @@ class DynamicChaseStopExecutor:
     # ========================================================================
     # 辅助方法
     # ========================================================================
+    
+    async def _check_existing_sell_orders(self, position: PositionStop) -> Optional[StopResult]:
+        """
+        检查是否有同一合约的遗留卖单
+        
+        防止重复卖出导致空单！
+        
+        Returns:
+            如果找到已成交的卖单，返回 StopResult；否则返回 None
+        """
+        contract_id = position.contract.conId
+        
+        for trade in self.ib.ib.trades():
+            if (trade.contract.conId == contract_id and 
+                trade.order.action == "SELL"):
+                
+                status = trade.orderStatus.status
+                
+                if status == "Filled":
+                    # 已有卖单成交！不能再卖
+                    fill_price = trade.orderStatus.avgFillPrice
+                    pnl = (fill_price - position.entry_price) * position.quantity * 100
+                    pnl_pct = (fill_price - position.entry_price) / position.entry_price
+                    
+                    logger.warning(
+                        f"⚠️ Found existing FILLED sell order for {position.contract.localSymbol} "
+                        f"@ ${fill_price:.2f}, skipping duplicate stop execution"
+                    )
+                    
+                    return StopResult(
+                        success=True,
+                        phase="DONE",
+                        fill_price=fill_price,
+                        pnl=pnl,
+                        pnl_pct=pnl_pct,
+                        chase_count=0,
+                        duration_ms=0
+                    )
+                
+                elif status in ["PreSubmitted", "Submitted", "PendingSubmit"]:
+                    # 有挂单，等待它完成
+                    logger.warning(
+                        f"⚠️ Found pending sell order {trade.order.orderId} for "
+                        f"{position.contract.localSymbol}, waiting for completion..."
+                    )
+                    
+                    # 等待挂单完成（最多 3 秒）
+                    for _ in range(30):
+                        await asyncio.sleep(0.1)
+                        await self.ib.sleep(0)
+                        
+                        if trade.orderStatus.status == "Filled":
+                            fill_price = trade.orderStatus.avgFillPrice
+                            pnl = (fill_price - position.entry_price) * position.quantity * 100
+                            pnl_pct = (fill_price - position.entry_price) / position.entry_price
+                            
+                            logger.info(
+                                f"✅ Pending sell order filled @ ${fill_price:.2f}"
+                            )
+                            
+                            return StopResult(
+                                success=True,
+                                phase="DONE",
+                                fill_price=fill_price,
+                                pnl=pnl,
+                                pnl_pct=pnl_pct,
+                                chase_count=0,
+                                duration_ms=0
+                            )
+                        elif trade.orderStatus.status == "Cancelled":
+                            logger.info("Pending sell order was cancelled, proceeding with new order")
+                            break
+                    
+                    # 如果还在挂单，取消它后再继续
+                    if trade.orderStatus.status not in ["Filled", "Cancelled"]:
+                        logger.warning(f"Cancelling stale pending order {trade.order.orderId}")
+                        await self._cancel_order_and_wait(trade.order.orderId, timeout_sec=0.5)
+        
+        return None
+    
+    async def _cancel_order_and_wait(self, order_id: int, timeout_sec: float = 1.0) -> bool:
+        """
+        取消订单并等待完成
+        
+        Returns:
+            True: 订单已取消
+            False: 订单已成交或取消失败
+        """
+        trade = self._get_trade_by_id(order_id)
+        if not trade:
+            return True
+        
+        if trade.orderStatus.status == "Filled":
+            logger.warning(f"Order {order_id} already filled, cannot cancel")
+            return False
+        
+        if trade.orderStatus.status == "Cancelled":
+            return True
+        
+        # 发送取消请求
+        self.ib.ib.cancelOrder(trade.order)
+        logger.info(f"Cancel request sent for order {order_id}")
+        
+        # 等待取消完成
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            await asyncio.sleep(0.1)
+            await self.ib.sleep(0)
+            
+            if trade.orderStatus.status == "Cancelled":
+                logger.info(f"Order {order_id} cancelled successfully")
+                return True
+            elif trade.orderStatus.status == "Filled":
+                logger.warning(f"Order {order_id} filled during cancel wait")
+                return False
+        
+        logger.error(f"Order {order_id} cancel timeout, status={trade.orderStatus.status}")
+        return False
     
     async def _get_fresh_quote(self, contract: Contract) -> Ticker:
         """获取最新报价"""

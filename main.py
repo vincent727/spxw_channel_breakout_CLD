@@ -31,6 +31,7 @@ if sys.platform == 'win32':
 import argparse
 import asyncio
 import logging
+import math
 import signal
 from datetime import datetime, time as dt_time
 from pathlib import Path
@@ -107,6 +108,10 @@ class TradingSystem:
         
         # SPX 合约（用于 K 线订阅）
         self._spx_contract = None
+        
+        # ★ 持仓合约映射（用于止损后取消 tick 订阅）
+        # position_id -> Contract
+        self._position_contracts: dict = {}
         
         # 运行状态
         self._running: bool = False
@@ -332,6 +337,21 @@ class TradingSystem:
             buffer=self.config.execution.limit_price_buffer
         )
         
+        # ★ 计算手数
+        fixed_amount = self.config.execution.fixed_investment_amount
+        if fixed_amount > 0:
+            # 根据固定投入金额计算手数
+            # 手数 = floor(金额 / (价格 * 100))
+            quantity = math.floor(fixed_amount / (entry_price * 100))
+            # 不到1手按1手
+            quantity = max(1, quantity)
+            logger.info(
+                f"Position sizing: ${fixed_amount:.0f} / (${entry_price:.2f} × 100) = {quantity} contracts"
+            )
+        else:
+            # 使用固定手数
+            quantity = self.config.execution.position_size
+        
         logger.info(
             f"Entry price: mid=${candidate.mid:.2f} + buffer=${self.config.execution.limit_price_buffer:.2f} "
             f"-> aligned=${entry_price:.2f}"
@@ -340,7 +360,7 @@ class TradingSystem:
         # 下单
         order_ctx = await self.order_manager.submit_buy_order(
             contract=candidate.contract,
-            quantity=self.config.execution.position_size,
+            quantity=quantity,
             limit_price=entry_price,
             signal_id=str(event.timestamp)
         )
@@ -462,6 +482,9 @@ class TradingSystem:
                 # 取消 tick 订阅（同步方法）
                 self.tick_streamer.unsubscribe(monitored.contract)
                 
+                # ★ 清理 position_contracts 映射
+                self._position_contracts.pop(position.id, None)
+                
                 # 关闭持仓
                 await self.state.close_position(position.id)
                 
@@ -493,8 +516,10 @@ class TradingSystem:
             is_call = event.contract.right == "C"
             direction = "LONG_CALL" if is_call else "LONG_PUT"
             
+            position_id = str(uuid.uuid4())
+            
             position = Position(
-                id=str(uuid.uuid4()),
+                id=position_id,
                 contract_id=event.contract.conId,
                 contract_symbol=event.contract_symbol,
                 direction=direction,
@@ -506,6 +531,9 @@ class TradingSystem:
             )
             
             await self.state.add_position(position)
+            
+            # ★ 保存 position_id -> contract 映射（用于止损后取消 tick 订阅）
+            self._position_contracts[position_id] = event.contract
             
             # 更新 TradingEngine 的持仓方向状态
             if self.trading_engine:
@@ -582,6 +610,53 @@ class TradingSystem:
             f"phase={event.phase} success={event.success} {pnl_str}"
         )
         
+        if not event.success:
+            # ★ 止损失败，检查是否有遗留订单已成交
+            logger.error(
+                f"Stop execution failed for {event.position_id[:8]}..., "
+                f"phase={event.phase}. Checking for filled orders..."
+            )
+            
+            contract = self._position_contracts.get(event.position_id)
+            if contract:
+                # 检查是否有该合约的已成交卖单
+                for trade in self.ib_adapter.ib.trades():
+                    if (trade.contract.conId == contract.conId and 
+                        trade.order.action == "SELL" and
+                        trade.orderStatus.status == "Filled"):
+                        
+                        logger.warning(
+                            f"⚠️ Found filled sell order during failed stop! "
+                            f"Fill price=${trade.orderStatus.avgFillPrice:.2f}. "
+                            f"Treating as success and cleaning up..."
+                        )
+                        
+                        # 按成功处理，清理状态
+                        self.tick_streamer.unsubscribe(contract)
+                        self._position_contracts.pop(event.position_id, None)
+                        
+                        if self.trading_engine:
+                            self.trading_engine.state.in_breakout = False
+                            self.trading_engine.state.last_signal_direction = ""
+                            self.trading_engine.state.signal_blocked_until_next_bar = True
+                            
+                            # 检查是否还有其他持仓
+                            remaining = self.state.get_all_positions()
+                            remaining = [p for p in remaining if p.id != event.position_id]
+                            if not remaining:
+                                self.trading_engine.state.current_position_direction = ""
+                        
+                        # 阻止后续重试
+                        self.stop_manager.remove_position(event.position_id)
+                        await self.state.close_position(event.position_id)
+                        
+                        logger.info("Cleaned up after finding filled order in failed stop")
+                        return
+            
+            # 如果没有成交的订单，继续监控等待重试
+            logger.info("No filled orders found, position remains monitored for retry")
+            return
+        
         if event.success:
             # 获取持仓信息（在关闭前获取）
             position = self.state.get_position(event.position_id)
@@ -612,6 +687,12 @@ class TradingSystem:
                     trade.realized_pnl > 0
                 )
             
+            # ★ 取消 tick 订阅（使用保存的合约映射）
+            contract = self._position_contracts.pop(event.position_id, None)
+            if contract:
+                self.tick_streamer.unsubscribe(contract)
+                logger.info(f"Tick subscription cancelled: {contract.localSymbol}")
+            
             # 清除 TradingEngine 的持仓方向状态
             # 检查是否还有其他持仓
             remaining = self.state.get_all_positions()
@@ -623,6 +704,11 @@ class TradingSystem:
                     if old_direction:
                         self.trading_engine.state.current_position_direction = ""
                         logger.info(f"Position direction cleared: {old_direction} (stop executed, no remaining)")
+                
+                # ★ 重置突破状态，允许重新捕捉相同方向的突破
+                self.trading_engine.state.in_breakout = False
+                self.trading_engine.state.last_signal_direction = ""
+                logger.info("Breakout state reset (position closed)")
                 
                 # 阻止本 bar 继续开仓（等下一根 bar）
                 self.trading_engine.state.signal_blocked_until_next_bar = True

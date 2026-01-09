@@ -135,6 +135,12 @@ class ExecutionConfig(BaseModel):
     max_position: int = Field(default=5, ge=1, le=50)
     max_premium_per_trade: float = Field(default=500.0, ge=50.0, le=10000.0)
     enforce_long_only: bool = True  # CRITICAL: 强制买方策略
+    
+    # 仓位计算：固定投入金额
+    # 如果 > 0，则根据期权价格计算手数：手数 = floor(金额 / (价格 * 100))
+    # 不到1手按1手计算
+    # 如果 = 0，则使用固定的 position_size
+    fixed_investment_amount: float = Field(default=0.0, ge=0.0, le=100000.0)
 
 
 class TickFilterConfig(BaseModel):
@@ -159,7 +165,7 @@ class ChaseStopConfig(BaseModel):
     
     # Phase 3: 紧急抛售
     panic_loss_threshold: float = Field(default=0.40, ge=0.20, le=0.80)
-    panic_price_factor: float = Field(default=0.80, ge=0.50, le=0.95)
+    panic_price_factor: float = Field(default=0.95, ge=0.80, le=0.99)
     abandon_price_threshold: float = Field(default=0.20, ge=0.05, le=1.0)
     
     # 最后手段

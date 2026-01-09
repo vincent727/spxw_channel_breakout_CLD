@@ -109,14 +109,18 @@ class TickStreamer:
         """
         订阅 Tick 数据
         
+        ★ 如果已存在订阅，会先取消再重新订阅，确保订阅有效
+        
         Returns:
             订阅是否成功
         """
         contract_id = contract.conId
         
+        # ★ 如果已存在，先取消再重新订阅（确保订阅有效）
+        # 这解决了平仓后遗留订阅导致的问题
         if contract_id in self.subscriptions:
-            logger.debug(f"Already subscribed: {contract.localSymbol}")
-            return True
+            logger.info(f"Re-subscribing to: {contract.localSymbol} (clearing stale subscription)")
+            self.unsubscribe(contract)
         
         try:
             # 订阅市场数据
@@ -173,7 +177,7 @@ class TickStreamer:
         if contract_id in self.stream_states:
             del self.stream_states[contract_id]
         
-        logger.debug(f"Unsubscribed: {contract.localSymbol}")
+        logger.info(f"Unsubscribed from tick stream: {contract.localSymbol}")
     
     def unsubscribe_all(self) -> None:
         """取消所有订阅"""

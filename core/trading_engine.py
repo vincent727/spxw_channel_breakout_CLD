@@ -736,6 +736,10 @@ class TradingEngine:
                     f"| SPX=${spx:.2f} "
                     f"| {'↑ ABOVE' if spx > channel.upper else '↓ BELOW' if spx < channel.lower else '→ INSIDE'}"
                 )
+                
+                # ★ K线完成时立即检查突破（减少信号延迟）
+                # 不依赖 tick 回调，在 K 线完成时主动检查
+                self._check_breakout_signal(spx)
             
             # 如果趋势周期K线完成，更新趋势
             if trend_completed:
