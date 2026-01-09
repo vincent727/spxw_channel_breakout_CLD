@@ -784,6 +784,139 @@ class TradingSystem:
                 
                 logger.info(f"Position closed and state cleaned up atomically (stop executed)")
     
+    async def _verify_position_consistency(self) -> None:
+        """
+        ★ 修复 10: 启动时验证持仓一致性
+        
+        检查 DB、TWS 和内存三者的持仓状态是否一致，并尝试同步。
+        """
+        logger.info("=" * 60)
+        logger.info("Verifying position consistency...")
+        logger.info("=" * 60)
+        
+        # 1. 获取本地数据库持仓
+        db_positions = self.state.get_all_positions()
+        logger.info(f"DB positions: {len(db_positions)}")
+        for pos in db_positions:
+            logger.info(f"  - {pos.contract_symbol} ({pos.direction}): {pos.quantity} @ ${pos.entry_price:.2f}")
+        
+        # 2. 获取 TWS 实际持仓（过滤 SPXW 期权）
+        tws_positions = await self.ib_adapter.get_positions()
+        spxw_tws_positions = [
+            p for p in tws_positions
+            if hasattr(p.contract, 'tradingClass') and p.contract.tradingClass == 'SPXW'
+        ]
+        logger.info(f"TWS SPXW positions: {len(spxw_tws_positions)}")
+        for pos in spxw_tws_positions:
+            logger.info(f"  - {pos.contract.localSymbol}: {pos.position} shares")
+        
+        # 3. 获取内存状态
+        memory_position_id = self._current_position_id
+        memory_direction = self._current_position_direction
+        logger.info(f"Memory position: id={memory_position_id[:8] if memory_position_id else 'None'}... direction={memory_direction or 'None'}")
+        
+        # 4. 检测不一致并尝试修复
+        inconsistencies = []
+        
+        # 检查：DB 有持仓但内存为空
+        if db_positions and not memory_position_id:
+            inconsistencies.append("DB has positions but memory is empty")
+            logger.warning("⚠️ Inconsistency: DB has positions but memory is empty, restoring from DB...")
+            
+            # 从 DB 恢复（只恢复第一个，因为系统设计为单持仓）
+            if len(db_positions) > 1:
+                logger.error(f"❌ CRITICAL: Multiple positions in DB ({len(db_positions)}), violates single-position constraint!")
+                inconsistencies.append(f"Multiple DB positions: {len(db_positions)}")
+                
+                # 发布错误事件
+                await self.event_bus.publish(ErrorEvent(
+                    error_type="POSITION_CONSISTENCY",
+                    error_message=f"Multiple positions in DB: {len(db_positions)}",
+                    component="TradingSystem",
+                    severity="CRITICAL"
+                ))
+            else:
+                position = db_positions[0]
+                self._current_position_id = position.id
+                self._current_position_direction = "CALL" if "CALL" in position.direction else "PUT"
+                logger.info(f"✅ Restored memory state from DB: {position.contract_symbol} ({self._current_position_direction})")
+        
+        # 检查：内存有持仓但 DB 为空
+        elif memory_position_id and not db_positions:
+            inconsistencies.append("Memory has position but DB is empty")
+            logger.warning("⚠️ Inconsistency: Memory has position but DB is empty, clearing memory...")
+            self._current_position_id = None
+            self._current_position_direction = ""
+            self._current_position_contract = None
+            logger.info("✅ Cleared memory state")
+        
+        # 检查：DB 有持仓但 TWS 没有
+        if db_positions and not spxw_tws_positions:
+            inconsistencies.append("DB has positions but TWS has none")
+            logger.warning(
+                "⚠️ Warning: DB has positions but TWS has none. "
+                "Position may have expired or been closed externally."
+            )
+            
+            # 发布警告事件
+            await self.event_bus.publish(ErrorEvent(
+                error_type="POSITION_CONSISTENCY",
+                error_message="DB has positions but TWS has none (may have expired)",
+                component="TradingSystem",
+                severity="WARNING"
+            ))
+        
+        # 检查：TWS 有持仓但 DB 没有
+        if spxw_tws_positions and not db_positions:
+            inconsistencies.append("TWS has positions but DB has none")
+            logger.warning(
+                "⚠️ Warning: TWS has positions but DB has none. "
+                "Position may have been opened externally or DB is out of sync."
+            )
+            
+            # 发布警告事件
+            await self.event_bus.publish(ErrorEvent(
+                error_type="POSITION_CONSISTENCY",
+                error_message="TWS has positions but DB has none (external position?)",
+                component="TradingSystem",
+                severity="WARNING"
+            ))
+        
+        # 检查：TWS 有多个 SPXW 持仓
+        if len(spxw_tws_positions) > 1:
+            inconsistencies.append(f"Multiple TWS SPXW positions: {len(spxw_tws_positions)}")
+            logger.error(
+                f"❌ CRITICAL: TWS has {len(spxw_tws_positions)} SPXW positions, "
+                f"violates single-position constraint!"
+            )
+            
+            # 发布错误事件
+            await self.event_bus.publish(ErrorEvent(
+                error_type="POSITION_CONSISTENCY",
+                error_message=f"Multiple TWS SPXW positions: {len(spxw_tws_positions)}",
+                component="TradingSystem",
+                severity="CRITICAL"
+            ))
+        
+        # 5. 同步 TradingEngine 状态
+        if self.trading_engine:
+            if memory_direction:
+                self.trading_engine.state.current_position_direction = memory_direction
+                logger.info(f"Synced TradingEngine direction: {memory_direction}")
+            else:
+                self.trading_engine.state.current_position_direction = ""
+                logger.info("TradingEngine direction cleared")
+        
+        # 6. 总结
+        if inconsistencies:
+            logger.warning(f"⚠️ Found {len(inconsistencies)} inconsistenc{'y' if len(inconsistencies) == 1 else 'ies'}:")
+            for inc in inconsistencies:
+                logger.warning(f"  - {inc}")
+        else:
+            logger.info("✅ Position consistency verified: all systems in sync")
+        
+        logger.info("=" * 60)
+    
     async def start(self) -> None:
         """启动交易系统 - 使用 Warm-up 工作流"""
         if self._running:
@@ -813,6 +946,9 @@ class TradingSystem:
         if not await self.trading_engine.warmup():
             logger.error("Warm-up phase failed")
             return
+        
+        # ★ 修复 10: 启动时验证持仓一致性
+        await self._verify_position_consistency()
         
         # 从引擎获取 SPX 合约
         self._spx_contract = self.trading_engine._spx_contract
