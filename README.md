@@ -211,6 +211,87 @@ strategy:
 pytest tests/ -v
 ```
 
+## 故障排除 (Troubleshooting)
+
+### 日志文件位置
+
+系统日志文件存储在 `logs/` 目录下，按日期自动分割：
+
+| 文件 | 描述 | 保留天数 |
+|------|------|----------|
+| `trading_{date}.log` | 完整系统日志 (DEBUG 级别) | 30 天 |
+| `trades_{date}.log` | 交易相关日志 | 90 天 |
+| `errors_{date}.log` | 错误日志 | 30 天 |
+
+### 如何报告错误
+
+遇到系统错误时，请按以下步骤提交 Issue：
+
+1. **收集日志文件**
+   ```bash
+   # 查看最近的错误
+   tail -100 logs/errors_$(date +%Y-%m-%d).log
+   
+   # 查看完整日志
+   cat logs/trading_$(date +%Y-%m-%d).log
+   ```
+
+2. **删除敏感信息**
+   
+   在分享日志前，请务必删除以下敏感内容：
+   - IBKR 账户信息
+   - Telegram Bot Token / Chat ID
+   - 邮箱账户密码
+   - 任何个人财务数据
+
+3. **提交 Issue**
+   
+   在 GitHub Issue 中包含：
+   - 错误描述和复现步骤
+   - 相关日志片段（使用代码块格式）
+   - 系统环境信息 (Python 版本、操作系统等)
+   - `config/settings.yaml` 配置（删除敏感信息后）
+
+**示例 Issue 格式：**
+
+> **问题描述**
+> 
+> [描述您遇到的问题]
+> 
+> **复现步骤**
+> 1. 启动系统 `python main.py --mode paper`
+> 2. 等待开盘信号
+> 3. 出现错误...
+> 
+> **错误日志**
+> 
+> [粘贴 logs/errors_{date}.log 中的相关内容，使用代码块格式]
+> 
+> **完整日志片段**
+> 
+> [粘贴 logs/trading_{date}.log 中的相关内容，使用代码块格式]
+> 
+> **环境信息**
+> - Python 版本: 3.10.x
+> - 操作系统: Ubuntu 22.04 / Windows 11 / macOS
+> - TWS/Gateway 版本: xxx
+
+### 常见问题
+
+**Q: 连接 IBKR 失败**
+```
+A: 检查 TWS/Gateway 是否启动，API 设置是否正确：
+   - 启用 Socket 客户端
+   - 端口设置正确 (Paper: 7497, Live: 7496)
+   - 允许的 IP 地址设置正确
+```
+
+**Q: 日志文件过大**
+```
+A: 系统自动保留 30 天日志，可手动清理：
+   rm logs/trading_2024-*.log  # 删除旧日志
+```
+
 ## ⚠️ 风险警告
 
 - 0DTE 期权具有极高风险，可能导致全部本金损失
