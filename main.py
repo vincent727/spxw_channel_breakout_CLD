@@ -37,6 +37,8 @@ from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Optional
 
+from ib_insync import Contract
+
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -49,7 +51,8 @@ from core import (
     TradingConfig, load_config, set_config,
     EventBus, set_event_bus,
     TradingState, set_state,
-    ConnectionEvent, SystemStatusEvent, SignalEvent, FillEvent, StopExecutionResultEvent
+    ConnectionEvent, SystemStatusEvent, SignalEvent, FillEvent, StopExecutionResultEvent,
+    ErrorEvent
 )
 from core.calendar import get_trading_calendar, get_0dte_expiry
 from execution import (
