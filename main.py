@@ -113,6 +113,13 @@ class TradingSystem:
         # position_id -> Contract
         self._position_contracts: dict = {}
         
+        # ★★★ 修复 1: 添加全局开仓锁 + 单一状态源 ★★★
+        # 防止并发信号竞态条件导致重复开仓
+        self._entry_lock: Optional[asyncio.Lock] = None  # 开仓流程保护锁
+        self._current_position_id: Optional[str] = None  # 当前持仓ID (单一状态源)
+        self._current_position_direction: str = ""  # 当前持仓方向 "CALL" 或 "PUT" (单一状态源)
+        self._current_position_contract: Optional[Contract] = None  # 当前持仓合约
+        
         # 运行状态
         self._running: bool = False
         self._stopped: bool = False  # 防止重复调用 stop()
@@ -130,6 +137,7 @@ class TradingSystem:
         # 在当前事件循环中创建 Event 和 Lock
         self._shutdown_event = asyncio.Event()
         self._stop_lock = asyncio.Lock()
+        self._entry_lock = asyncio.Lock()  # 修复 1: 初始化开仓锁
         
         try:
             # 1. 核心组件
@@ -263,110 +271,135 @@ class TradingSystem:
         """
         处理交易信号 - 严格单持仓控制
         
+        ★★★ 修复 2: 用锁保护整个开仓流程 ★★★
+        
         规则：
         1. 任何时候不允许同时持有 CALL 和 PUT
         2. 最多只能持有一个持仓
         3. 不重复开仓，反向信号时先平后开
         4. 如果止损正在执行，忽略信号（防止重复平仓产生净空头）
+        5. 使用 _entry_lock 防止并发信号竞态条件
         """
-        # 检查熔断器
-        allowed, reason = self.circuit_breaker.is_trading_allowed()
-        if not allowed:
-            logger.warning(f"Signal blocked by circuit breaker: {reason}")
-            return
-        
-        logger.info(f"Processing signal: {event.signal_type}")
-        
-        # 确定信号方向
-        signal_direction = "CALL" if event.signal_type == "LONG_CALL" else "PUT"
-        
-        # 获取当前持仓（直接查询，不依赖 current_position_direction）
-        positions = self.state.get_all_positions()
-        
-        if positions:
-            existing_position = positions[0]  # 最多只有一个
-            existing_direction = "CALL" if "C" in existing_position.contract_symbol else "PUT"
-            
-            # ★ 关键检查：如果该持仓正在执行止损，忽略信号
-            # 防止止损和反转平仓同时发送卖单，导致净空头
-            if existing_position.id in self.stop_manager.executing_stops:
-                logger.warning(
-                    f"Signal ignored: Stop already executing for {existing_position.contract_symbol}. "
-                    f"Preventing duplicate sell order that could create naked short position."
-                )
+        # ★★★ 修复 2: 获取开仓锁，整个流程期间持有 ★★★
+        async with self._entry_lock:
+            # 检查熔断器
+            allowed, reason = self.circuit_breaker.is_trading_allowed()
+            if not allowed:
+                logger.warning(f"Signal blocked by circuit breaker: {reason}")
                 return
             
-            if existing_direction == signal_direction:
-                # 同方向 → 忽略信号
-                logger.info(f"Signal ignored: Already holding {existing_direction}")
-                return
-            else:
-                # 反方向 → 先平仓再开新仓
-                logger.info(f"Reverse signal: Closing {existing_direction} to open {signal_direction}")
+            logger.info(f"Processing signal: {event.signal_type}")
+            
+            # 确定信号方向
+            signal_direction = "CALL" if event.signal_type == "LONG_CALL" else "PUT"
+            
+            # ★★★ 修复 2: 使用单一状态源检查当前持仓 ★★★
+            # 不再查询数据库，直接使用内存中的状态
+            if self._current_position_direction:
+                # 已有持仓
+                existing_direction = self._current_position_direction
+                existing_position_id = self._current_position_id
                 
-                # 执行反向平仓
-                closed = await self._close_for_reversal(existing_position)
-                if not closed:
-                    logger.error("Failed to close position for reversal, aborting new entry")
+                # ★ 关键检查：如果该持仓正在执行止损，忽略信号
+                # 防止止损和反转平仓同时发送卖单，导致净空头
+                if existing_position_id and existing_position_id in self.stop_manager.executing_stops:
+                    logger.warning(
+                        f"Signal ignored: Stop already executing for position {existing_position_id[:8]}... "
+                        f"Preventing duplicate sell order that could create naked short position."
+                    )
                     return
                 
-                # 平仓成功，继续开新仓
-        
-        # 获取 SPX 价格 (优先使用事件中的价格，其次从引擎获取)
-        spx_price = event.spx_price
-        if not spx_price and self.trading_engine:
-            spx_price = self.trading_engine.state.spx_price
-        if not spx_price and self.strategy:
-            spx_price = self.strategy.state.spx_price
-        
-        if not spx_price:
-            logger.warning("No SPX price available for option selection")
-            return
-        
-        # 选择期权
-        candidate = await self.option_selector.select_option(event, spx_price)
-        
-        if not candidate:
-            logger.warning("No suitable option found for signal")
-            return
-        
-        # 计算入场价格（使用 SPXW tick size 对齐）
-        from execution.price_utils import calculate_entry_price
-        entry_price = calculate_entry_price(
-            mid=candidate.mid,
-            buffer=self.config.execution.limit_price_buffer
-        )
-        
-        # ★ 计算手数
-        fixed_amount = self.config.execution.fixed_investment_amount
-        if fixed_amount > 0:
-            # 根据固定投入金额计算手数
-            # 手数 = floor(金额 / (价格 * 100))
-            quantity = math.floor(fixed_amount / (entry_price * 100))
-            # 不到1手按1手
-            quantity = max(1, quantity)
-            logger.info(
-                f"Position sizing: ${fixed_amount:.0f} / (${entry_price:.2f} × 100) = {quantity} contracts"
+                if existing_direction == signal_direction:
+                    # 同方向 → 忽略信号
+                    logger.info(f"Signal ignored: Already holding {existing_direction}")
+                    return
+                else:
+                    # 反方向 → 先平仓再开新仓
+                    logger.info(f"Reverse signal: Closing {existing_direction} to open {signal_direction}")
+                    
+                    # 从数据库获取完整持仓信息用于平仓
+                    existing_position = self.state.get_position(existing_position_id)
+                    if not existing_position:
+                        logger.error(f"Position {existing_position_id} not found in state!")
+                        # 状态不一致，清理内存状态
+                        self._current_position_id = None
+                        self._current_position_direction = ""
+                        self._current_position_contract = None
+                        return
+                    
+                    # 执行反向平仓
+                    closed = await self._close_for_reversal(existing_position)
+                    if not closed:
+                        logger.error("Failed to close position for reversal, aborting new entry")
+                        return
+                    
+                    # 平仓成功，继续开新仓
+            
+            # ★★★ 修复 6: 下单前二次确认没有持仓 ★★★
+            if self._current_position_id is not None:
+                logger.warning(f"Signal aborted: Position opened during processing (race detected)")
+                return
+            
+            # 获取 SPX 价格 (优先使用事件中的价格，其次从引擎获取)
+            spx_price = event.spx_price
+            if not spx_price and self.trading_engine:
+                spx_price = self.trading_engine.state.spx_price
+            if not spx_price and self.strategy:
+                spx_price = self.strategy.state.spx_price
+            
+            if not spx_price:
+                logger.warning("No SPX price available for option selection")
+                return
+            
+            # 选择期权
+            candidate = await self.option_selector.select_option(event, spx_price)
+            
+            if not candidate:
+                logger.warning("No suitable option found for signal")
+                return
+            
+            # ★★★ 修复 6: 选择期权后三次确认状态未变化 ★★★
+            if self._current_position_id is not None:
+                logger.warning(f"Signal aborted: Position opened during option selection (race detected)")
+                return
+            
+            # 计算入场价格（使用 SPXW tick size 对齐）
+            from execution.price_utils import calculate_entry_price
+            entry_price = calculate_entry_price(
+                mid=candidate.mid,
+                buffer=self.config.execution.limit_price_buffer
             )
-        else:
-            # 使用固定手数
-            quantity = self.config.execution.position_size
-        
-        logger.info(
-            f"Entry price: mid=${candidate.mid:.2f} + buffer=${self.config.execution.limit_price_buffer:.2f} "
-            f"-> aligned=${entry_price:.2f}"
-        )
-        
-        # 下单
-        order_ctx = await self.order_manager.submit_buy_order(
-            contract=candidate.contract,
-            quantity=quantity,
-            limit_price=entry_price,
-            signal_id=str(event.timestamp)
-        )
-        
-        if order_ctx:
-            logger.info(f"Order submitted: {order_ctx.order_id}")
+            
+            # ★ 计算手数
+            fixed_amount = self.config.execution.fixed_investment_amount
+            if fixed_amount > 0:
+                # 根据固定投入金额计算手数
+                # 手数 = floor(金额 / (价格 * 100))
+                quantity = math.floor(fixed_amount / (entry_price * 100))
+                # 不到1手按1手
+                quantity = max(1, quantity)
+                logger.info(
+                    f"Position sizing: ${fixed_amount:.0f} / (${entry_price:.2f} × 100) = {quantity} contracts"
+                )
+            else:
+                # 使用固定手数
+                quantity = self.config.execution.position_size
+            
+            logger.info(
+                f"Entry price: mid=${candidate.mid:.2f} + buffer=${self.config.execution.limit_price_buffer:.2f} "
+                f"-> aligned=${entry_price:.2f}"
+            )
+            
+            # 下单
+            order_ctx = await self.order_manager.submit_buy_order(
+                contract=candidate.contract,
+                quantity=quantity,
+                limit_price=entry_price,
+                signal_id=str(event.timestamp)
+            )
+            
+            if order_ctx:
+                logger.info(f"Order submitted: {order_ctx.order_id}")
     
     async def _close_for_reversal(self, position) -> bool:
         """
@@ -488,11 +521,15 @@ class TradingSystem:
                 # 关闭持仓
                 await self.state.close_position(position.id)
                 
-                # 清除方向（此时无持仓）
+                # ★★★ 修复 3/4: 原子清理持仓状态（在锁内） ★★★
+                self._current_position_id = None
+                self._current_position_direction = ""
+                self._current_position_contract = None
+                logger.info(f"Position state cleared atomically (reversal close)")
+                
+                # 清除 TradingEngine 方向
                 if self.trading_engine:
-                    old_direction = self.trading_engine.state.current_position_direction
                     self.trading_engine.state.current_position_direction = ""
-                    logger.info(f"Position direction cleared: {old_direction} (reversal close)")
                 
                 return True
             else:
@@ -506,47 +543,61 @@ class TradingSystem:
             self.stop_manager.executing_stops.discard(position.id)
     
     async def _on_fill(self, event: FillEvent) -> None:
-        """处理成交"""
+        """
+        处理成交
+        
+        ★★★ 修复 3: 原子更新持仓状态 ★★★
+        """
         if event.is_entry:
-            # 新建持仓
-            from core.state import Position
-            import uuid
-            
-            # 确定持仓方向
-            is_call = event.contract.right == "C"
-            direction = "LONG_CALL" if is_call else "LONG_PUT"
-            
-            position_id = str(uuid.uuid4())
-            
-            position = Position(
-                id=position_id,
-                contract_id=event.contract.conId,
-                contract_symbol=event.contract_symbol,
-                direction=direction,
-                quantity=event.quantity,
-                entry_price=event.fill_price,
-                current_price=event.fill_price,
-                highest_price=event.fill_price,
-                entry_order_id=event.order_id
-            )
-            
-            await self.state.add_position(position)
-            
-            # ★ 保存 position_id -> contract 映射（用于止损后取消 tick 订阅）
-            self._position_contracts[position_id] = event.contract
-            
-            # 更新 TradingEngine 的持仓方向状态
-            if self.trading_engine:
-                self.trading_engine.state.current_position_direction = "CALL" if is_call else "PUT"
-                logger.info(f"Position direction updated: {self.trading_engine.state.current_position_direction}")
-            
-            # 添加到止损监控
-            self.stop_manager.add_position(position, event.contract)
-            
-            # 订阅 Tick 数据
-            await self.tick_streamer.subscribe(event.contract)
-            
-            logger.info(f"Position opened and monitored: {event.contract_symbol}")
+            # ★★★ 修复 3: 获取锁以原子更新持仓状态 ★★★
+            async with self._entry_lock:
+                # 新建持仓
+                from core.state import Position
+                import uuid
+                
+                # 确定持仓方向
+                is_call = event.contract.right == "C"
+                direction = "LONG_CALL" if is_call else "LONG_PUT"
+                
+                position_id = str(uuid.uuid4())
+                
+                position = Position(
+                    id=position_id,
+                    contract_id=event.contract.conId,
+                    contract_symbol=event.contract_symbol,
+                    direction=direction,
+                    quantity=event.quantity,
+                    entry_price=event.fill_price,
+                    current_price=event.fill_price,
+                    highest_price=event.fill_price,
+                    entry_order_id=event.order_id
+                )
+                
+                await self.state.add_position(position)
+                
+                # ★★★ 修复 3: 原子更新所有状态 ★★★
+                self._current_position_id = position_id
+                self._current_position_direction = "CALL" if is_call else "PUT"
+                self._current_position_contract = event.contract
+                self._position_contracts[position_id] = event.contract
+                
+                logger.info(
+                    f"Position state updated atomically: "
+                    f"id={position_id[:8]}... direction={self._current_position_direction}"
+                )
+                
+                # 更新 TradingEngine 的持仓方向状态
+                if self.trading_engine:
+                    self.trading_engine.state.current_position_direction = self._current_position_direction
+                    logger.info(f"TradingEngine position direction: {self._current_position_direction}")
+                
+                # 添加到止损监控
+                self.stop_manager.add_position(position, event.contract)
+                
+                # 订阅 Tick 数据
+                await self.tick_streamer.subscribe(event.contract)
+                
+                logger.info(f"Position opened and monitored: {event.contract_symbol}")
         else:
             # 平仓
             if event.position_id:
@@ -602,6 +653,42 @@ class TradingSystem:
         elif event.status == "CONNECTED":
             logger.info("Connection restored")
     
+    async def _cleanup_position_state_locked(self, position_id: str) -> None:
+        """
+        ★★★ 修复 4: 统一清理持仓状态（必须在锁内调用） ★★★
+        
+        原子清理所有与持仓相关的状态:
+        - 内存状态 (_current_position_*)
+        - TradingEngine 状态
+        - position_contracts 映射
+        """
+        # 只在清理的是当前持仓时才更新状态
+        if self._current_position_id == position_id:
+            old_direction = self._current_position_direction
+            self._current_position_id = None
+            self._current_position_direction = ""
+            self._current_position_contract = None
+            logger.info(
+                f"Position state cleared atomically: "
+                f"id={position_id[:8]}... direction={old_direction}"
+            )
+        
+        # 清理合约映射
+        self._position_contracts.pop(position_id, None)
+        
+        # 清理 TradingEngine 状态
+        if self.trading_engine:
+            # 检查是否还有其他持仓
+            remaining = self.state.get_all_positions()
+            remaining = [p for p in remaining if p.id != position_id]
+            
+            if not remaining:
+                self.trading_engine.state.current_position_direction = ""
+                self.trading_engine.state.in_breakout = False
+                self.trading_engine.state.last_signal_direction = ""
+            
+            self.trading_engine.state.signal_blocked_until_next_bar = True
+    
     async def _on_stop_result(self, event: StopExecutionResultEvent) -> None:
         """处理止损执行结果"""
         pnl_str = f"pnl=${event.pnl:.2f} ({event.pnl_pct:.1%})" if event.pnl else "pnl=N/A"
@@ -631,24 +718,17 @@ class TradingSystem:
                             f"Treating as success and cleaning up..."
                         )
                         
-                        # 按成功处理，清理状态
-                        self.tick_streamer.unsubscribe(contract)
-                        self._position_contracts.pop(event.position_id, None)
-                        
-                        if self.trading_engine:
-                            self.trading_engine.state.in_breakout = False
-                            self.trading_engine.state.last_signal_direction = ""
-                            self.trading_engine.state.signal_blocked_until_next_bar = True
+                        # ★★★ 修复 4: 使用统一清理方法（在锁内） ★★★
+                        async with self._entry_lock:
+                            # 取消 tick 订阅
+                            self.tick_streamer.unsubscribe(contract)
                             
-                            # 检查是否还有其他持仓
-                            remaining = self.state.get_all_positions()
-                            remaining = [p for p in remaining if p.id != event.position_id]
-                            if not remaining:
-                                self.trading_engine.state.current_position_direction = ""
-                        
-                        # 阻止后续重试
-                        self.stop_manager.remove_position(event.position_id)
-                        await self.state.close_position(event.position_id)
+                            # 原子清理状态
+                            await self._cleanup_position_state_locked(event.position_id)
+                            
+                            # 移除监控
+                            self.stop_manager.remove_position(event.position_id)
+                            await self.state.close_position(event.position_id)
                         
                         logger.info("Cleaned up after finding filled order in failed stop")
                         return
@@ -658,61 +738,51 @@ class TradingSystem:
             return
         
         if event.success:
-            # 获取持仓信息（在关闭前获取）
-            position = self.state.get_position(event.position_id)
-            if position:
-                # 记录交易
-                from core.state import Trade
+            # ★★★ 修复 4: 在锁内原子清理所有状态 ★★★
+            async with self._entry_lock:
+                # 获取持仓信息（在关闭前获取）
+                position = self.state.get_position(event.position_id)
+                if position:
+                    # 记录交易
+                    from core.state import Trade
+                    
+                    trade = Trade(
+                        position_id=event.position_id,
+                        contract_id=position.contract_id,
+                        contract_symbol=position.contract_symbol,
+                        direction=position.direction,
+                        entry_time=position.entry_time,
+                        entry_price=position.entry_price,
+                        exit_time=datetime.now(),
+                        exit_price=event.fill_price or 0,
+                        quantity=position.quantity,
+                        realized_pnl=event.pnl or 0,
+                        status="CLOSED"
+                    )
+                    trade.realized_pnl_pct = event.pnl_pct or 0
+                    
+                    await self.state.add_trade(trade)
+                    
+                    # 更新熔断器
+                    await self.circuit_breaker.record_trade_result(
+                        trade.realized_pnl,
+                        trade.realized_pnl > 0
+                    )
                 
-                trade = Trade(
-                    position_id=event.position_id,
-                    contract_id=position.contract_id,
-                    contract_symbol=position.contract_symbol,
-                    direction=position.direction,
-                    entry_time=position.entry_time,
-                    entry_price=position.entry_price,
-                    exit_time=datetime.now(),
-                    exit_price=event.fill_price or 0,
-                    quantity=position.quantity,
-                    realized_pnl=event.pnl or 0,
-                    status="CLOSED"
-                )
-                trade.realized_pnl_pct = event.pnl_pct or 0
+                # ★ 取消 tick 订阅（使用保存的合约映射）
+                contract = self._position_contracts.get(event.position_id)
+                if contract:
+                    self.tick_streamer.unsubscribe(contract)
+                    logger.info(f"Tick subscription cancelled: {contract.localSymbol}")
                 
-                await self.state.add_trade(trade)
+                # ★★★ 修复 4: 使用统一清理方法 ★★★
+                await self._cleanup_position_state_locked(event.position_id)
                 
-                # 更新熔断器
-                await self.circuit_breaker.record_trade_result(
-                    trade.realized_pnl,
-                    trade.realized_pnl > 0
-                )
-            
-            # ★ 取消 tick 订阅（使用保存的合约映射）
-            contract = self._position_contracts.pop(event.position_id, None)
-            if contract:
-                self.tick_streamer.unsubscribe(contract)
-                logger.info(f"Tick subscription cancelled: {contract.localSymbol}")
-            
-            # 清除 TradingEngine 的持仓方向状态
-            # 检查是否还有其他持仓
-            remaining = self.state.get_all_positions()
-            remaining = [p for p in remaining if p.id != event.position_id]
-            
-            if self.trading_engine:
-                if not remaining:
-                    old_direction = self.trading_engine.state.current_position_direction
-                    if old_direction:
-                        self.trading_engine.state.current_position_direction = ""
-                        logger.info(f"Position direction cleared: {old_direction} (stop executed, no remaining)")
+                # 移除监控和关闭持仓
+                self.stop_manager.remove_position(event.position_id)
+                await self.state.close_position(event.position_id)
                 
-                # ★ 重置突破状态，允许重新捕捉相同方向的突破
-                self.trading_engine.state.in_breakout = False
-                self.trading_engine.state.last_signal_direction = ""
-                logger.info("Breakout state reset (position closed)")
-                
-                # 阻止本 bar 继续开仓（等下一根 bar）
-                self.trading_engine.state.signal_blocked_until_next_bar = True
-                logger.info("Signal blocked until next bar (stop executed)")
+                logger.info(f"Position closed and state cleaned up atomically (stop executed)")
     
     async def start(self) -> None:
         """启动交易系统 - 使用 Warm-up 工作流"""
